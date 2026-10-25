@@ -56,6 +56,7 @@ use tracing_subscriber::prelude::*;
 
 #[cfg(target_arch = "wasm32")]
 mod browser_files;
+mod console_log;
 mod session_file;
 
 const VOLTAGE_COLOR: Color32 = Color32::from_rgb(80, 220, 120);
@@ -97,7 +98,6 @@ const STRIP_GAP: f32 = 16.0;
 /// Gap between voltage and current, and between current and power.
 const STRIP_GAP_BETWEEN: f32 = STRIP_GAP * 1.3;
 /// Horizontal and vertical inset of egui's central panel frame.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 const CENTRAL_PANEL_MARGIN: f32 = 8.0;
 /// Space Mono's advance width, in font units per em.
 const SPACE_MONO_ADVANCE_EM: f32 = 612.0 / 1000.0;
@@ -177,7 +177,8 @@ fn main() {
 
     console_error_panic_hook::set_once();
     let _ = eframe::WebLogger::init(log::LevelFilter::Info);
-    tracing_wasm::set_as_global_default();
+    console_log::init();
+    info!("Starting KM003C scope");
     wasm_bindgen_futures::spawn_local(async {
         let canvas = web_sys::window()
             .and_then(|window| window.document())
@@ -370,6 +371,15 @@ impl eframe::App for ScopeApp {
         let repaint = if self.streaming { 16 } else { 100 };
         ui.ctx().request_repaint_after(Duration::from_millis(repaint));
 
+        #[cfg(target_arch = "wasm32")]
+        {
+            let console_height = console_log::panel_height(ui.available_height(), window_size(INITIAL_SECONDS)[1]);
+            egui::Panel::bottom("web_console")
+                .exact_size(console_height)
+                .resizable(false)
+                .frame(egui::Frame::new().fill(Color32::BLACK).inner_margin(8.0))
+                .show(ui, web_console);
+        }
         egui::Panel::left("side")
             .resizable(false)
             .exact_size(meter_pane_width())
@@ -385,6 +395,25 @@ impl eframe::App for ScopeApp {
         self.device_info_dialog(ui.ctx());
         self.pd_info_dialog(ui.ctx());
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_console(ui: &mut egui::Ui) {
+    let font = egui::FontId::new(13.0, egui::FontFamily::Name("Space Mono".into()));
+    ui.spacing_mut().item_spacing.y = 1.0;
+    let lines = console_log::snapshot();
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .stick_to_bottom(true)
+        .show(ui, |ui| {
+            for line in lines {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(line.text).font(font.clone()).color(line.color))
+                        .selectable(true)
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
+            }
+        });
 }
 
 /// A native info window uses the operating system's close button.
@@ -3489,7 +3518,6 @@ fn format_tick_magnitude(value: f64, decimals: usize) -> String {
 }
 
 /// Meter pane, central-panel padding, one Y axis, and `seconds` of plot at 100 px/s.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn window_size(seconds: f64) -> [f32; 2] {
     let plot_inner = (seconds * PIXELS_PER_SECOND) as f32;
     let width = meter_pane_width() + CENTRAL_PANEL_MARGIN * 2.0 + AXIS_THICKNESS + plot_inner;
