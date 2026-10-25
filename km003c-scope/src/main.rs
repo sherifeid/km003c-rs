@@ -118,6 +118,7 @@ const METER_BOX_MARGIN: f32 = 8.0;
 const SIDE_PANEL_SEPARATOR: f32 = 1.0;
 /// Newest samples kept, at any rate. This is 10 hours at 50/s and 30 minutes at 1000/s.
 const MAX_SAMPLES: usize = 1_800_000;
+#[cfg(not(target_arch = "wasm32"))]
 const USB_RESET_SUPPORTED: bool = !cfg!(target_os = "windows");
 include!(concat!(env!("OUT_DIR"), "/usb_vendors.rs"));
 const RATES: [GraphSampleRate; 4] = [
@@ -194,7 +195,6 @@ fn main() {
             file_tx,
             file_rx,
             rate,
-            false,
             "Click Connect to select the KM003C",
         );
         let result = eframe::WebRunner::new()
@@ -280,6 +280,8 @@ struct ScopeApp {
     overview_press: Option<egui::Pos2>,
     /// The current press started on a floating window, so it must not pan the strips.
     window_has_pointer: bool,
+    /// Host bus reset before the next desktop connect. The browser has no usable reset.
+    #[cfg(not(target_arch = "wasm32"))]
     usb_reset: bool,
     /// Wall time of the latest disconnect, while captured samples are still in the buffer.
     disconnected_at: Option<DateTime<Utc>>,
@@ -407,8 +409,29 @@ fn web_console(ui: &mut egui::Ui) {
         .stick_to_bottom(true)
         .show(ui, |ui| {
             for line in lines {
+                let mut job = egui::text::LayoutJob::default();
+                let dim = egui::TextFormat {
+                    font_id: font.clone(),
+                    color: console_log::DIM,
+                    ..Default::default()
+                };
+                let level = egui::TextFormat {
+                    font_id: font.clone(),
+                    color: line.level_color,
+                    ..Default::default()
+                };
+                let message = egui::TextFormat {
+                    font_id: font.clone(),
+                    color: console_log::MESSAGE,
+                    ..Default::default()
+                };
+                job.append(&line.time, 0.0, dim.clone());
+                job.append(" ", 0.0, dim.clone());
+                job.append(&line.level, 0.0, level);
+                job.append(&format!(" {}: ", line.target), 0.0, dim);
+                job.append(&line.message, 0.0, message);
                 ui.add(
-                    egui::Label::new(egui::RichText::new(line.text).font(font.clone()).color(line.color))
+                    egui::Label::new(job)
                         .selectable(true)
                         .wrap_mode(egui::TextWrapMode::Extend),
                 );
@@ -474,7 +497,7 @@ impl ScopeApp {
         file_tx: std::sync::mpsc::Sender<FileMessage>,
         file_rx: std::sync::mpsc::Receiver<FileMessage>,
         rate: GraphSampleRate,
-        usb_reset: bool,
+        #[cfg(not(target_arch = "wasm32"))] usb_reset: bool,
         status: impl Into<String>,
     ) -> Self {
         Self {
@@ -514,6 +537,7 @@ impl ScopeApp {
             overview_grabbed: false,
             overview_press: None,
             window_has_pointer: false,
+            #[cfg(not(target_arch = "wasm32"))]
             usb_reset,
             disconnected_at: None,
             timeline_shift_us: 0,
@@ -1326,19 +1350,20 @@ impl ScopeApp {
     fn controls(&mut self, ui: &mut egui::Ui) {
         ui.label(self.status.as_str());
         ui.add_space(8.0);
-        let reset_supported = usb_reset_supported();
-        ui.add_enabled(
-            reset_supported,
-            egui::Checkbox::new(&mut self.usb_reset, "USB reset on connect"),
-        )
-        .on_hover_text(if reset_supported {
-            "Applied the next time Connect runs. Leave this off on macOS."
-        } else if cfg!(target_arch = "wasm32") {
-            "The browser cannot reset the USB device."
-        } else {
-            "WinUSB does not support USB device reset."
-        });
-        ui.add_space(8.0);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let reset_supported = usb_reset_supported();
+            ui.add_enabled(
+                reset_supported,
+                egui::Checkbox::new(&mut self.usb_reset, "USB reset on connect"),
+            )
+            .on_hover_text(if reset_supported {
+                "Applied the next time Connect runs. Leave this off on macOS."
+            } else {
+                "WinUSB does not support USB device reset."
+            });
+            ui.add_space(8.0);
+        }
         self.session_buttons(ui);
         ui.add_space(8.0);
         ui.checkbox(&mut self.autoscroll, "Autoscroll");
@@ -3335,8 +3360,9 @@ fn seconds_to_us(seconds: f64) -> u64 {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn usb_reset_supported() -> bool {
-    USB_RESET_SUPPORTED && !cfg!(target_arch = "wasm32")
+    USB_RESET_SUPPORTED
 }
 
 #[cfg(not(target_arch = "wasm32"))]

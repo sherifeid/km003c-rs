@@ -23,16 +23,27 @@ pub const MIN_HEIGHT: f32 = 140.0;
 const MAX_LINES: usize = 500;
 
 struct Line {
-    text: String,
-    color: Color32,
+    time: String,
+    level: String,
+    level_color: Color32,
+    target: String,
+    message: String,
 }
 
 static LINES: Mutex<VecDeque<Line>> = Mutex::new(VecDeque::new());
 
 pub struct Entry {
-    pub text: String,
-    pub color: Color32,
+    pub time: String,
+    pub level: String,
+    pub level_color: Color32,
+    pub target: String,
+    pub message: String,
 }
+
+/// Dim grey used for the timestamp and the module path, matching a terminal's dim text.
+pub const DIM: Color32 = Color32::from_rgb(140, 140, 140);
+/// Normal message text. The level word is the only part that takes the level color.
+pub const MESSAGE: Color32 = Color32::from_rgb(220, 220, 220);
 
 /// Height of the console under a plot stack of `plots` pixels.
 pub fn panel_height(available: f32, plots: f32) -> f32 {
@@ -45,8 +56,11 @@ pub fn snapshot() -> Vec<Entry> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
         .map(|line| Entry {
-            text: line.text.clone(),
-            color: line.color,
+            time: line.time.clone(),
+            level: line.level.clone(),
+            level_color: line.level_color,
+            target: line.target.clone(),
+            message: line.message.clone(),
         })
         .collect()
 }
@@ -117,31 +131,40 @@ impl Visit for MessageVisitor {
 }
 
 fn push_line(level: Level, target: &str, message: &str) {
-    let text = format_line(level, target, message);
+    let time = Local::now().format("%H:%M:%S%.3f").to_string();
+    let level_label = level_label(level);
     #[cfg(target_arch = "wasm32")]
-    web_sys::console::log_1(&text.as_str().into());
+    web_sys::console::log_1(&format!("{time} {level_label} {target}: {message}").into());
     let mut lines = LINES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     lines.push_back(Line {
-        text,
-        color: level_color(level),
+        time,
+        level: level_label.to_string(),
+        level_color: level_color(level),
+        target: target.to_string(),
+        message: message.to_string(),
     });
     while lines.len() > MAX_LINES {
         lines.pop_front();
     }
 }
 
-fn format_line(level: Level, target: &str, message: &str) -> String {
-    let time = Local::now().format("%H:%M:%S%.3f");
-    format!("{time} {level:<5} {target}: {message}")
+fn level_label(level: Level) -> &'static str {
+    match level {
+        Level::ERROR => "ERROR",
+        Level::WARN => " WARN",
+        Level::INFO => " INFO",
+        Level::DEBUG => "DEBUG",
+        Level::TRACE => "TRACE",
+    }
 }
 
 fn level_color(level: Level) -> Color32 {
     match level {
-        Level::ERROR => Color32::from_rgb(255, 96, 96),
-        Level::WARN => Color32::from_rgb(255, 196, 64),
-        Level::INFO => Color32::from_rgb(126, 214, 126),
-        Level::DEBUG => Color32::from_rgb(120, 176, 255),
-        Level::TRACE => Color32::from_rgb(168, 168, 168),
+        Level::ERROR => Color32::from_rgb(230, 70, 70),
+        Level::WARN => Color32::from_rgb(230, 180, 40),
+        Level::INFO => Color32::from_rgb(50, 190, 80),
+        Level::DEBUG => Color32::from_rgb(90, 150, 230),
+        Level::TRACE => Color32::from_rgb(180, 120, 220),
     }
 }
 
@@ -157,10 +180,13 @@ mod tests {
 
     #[test]
     fn console_line_matches_the_desktop_tracing_shape() {
-        let text = format_line(Level::INFO, "km003c_lib::session", "Connected to KM003C");
-        assert!(text.contains(" INFO  km003c_lib::session: Connected to KM003C"));
-        assert_eq!(level_color(Level::ERROR), Color32::from_rgb(255, 96, 96));
+        assert_eq!(level_label(Level::INFO), " INFO");
+        assert_eq!(level_label(Level::WARN), " WARN");
+        assert_eq!(level_label(Level::ERROR), "ERROR");
+        assert_eq!(level_color(Level::ERROR), Color32::from_rgb(230, 70, 70));
         assert_ne!(level_color(Level::WARN), level_color(Level::INFO));
+        assert_ne!(level_color(Level::INFO), DIM);
+        assert_ne!(MESSAGE, level_color(Level::INFO));
     }
 
     #[test]
@@ -174,7 +200,13 @@ mod tests {
         }
         let lines = LINES.lock().unwrap();
         assert_eq!(lines.len(), MAX_LINES);
-        assert!(lines.front().unwrap().text.contains("line 3"));
-        assert!(lines.back().unwrap().text.contains(&format!("line {}", MAX_LINES + 2)));
+        assert!(lines.front().unwrap().message.contains("line 3"));
+        assert!(
+            lines
+                .back()
+                .unwrap()
+                .message
+                .contains(&format!("line {}", MAX_LINES + 2))
+        );
     }
 }
