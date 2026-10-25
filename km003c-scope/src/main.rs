@@ -76,6 +76,11 @@ const MIN_SECONDS: f64 = 4.0;
 const STRIP_HEIGHT: f32 = 200.0;
 /// Full-buffer preview above the event lane, one sixth of a measurement strip.
 const OVERVIEW_HEIGHT: f32 = STRIP_HEIGHT / 6.0;
+/// A disconnect longer than this is a fixed mark in the navigator, not a to-scale gap.
+const OVERVIEW_LARGE_GAP_SECS: f64 = 60.0;
+/// Width of that mark. The timestamps still hold the real duration.
+const OVERVIEW_GAP_MARK_PX: f32 = 8.0;
+const OVERVIEW_GAP_COLOR: Color32 = Color32::from_rgb(220, 64, 64);
 /// Vertical padding around an autoscaled trace, as a fraction of its span.
 const Y_MARGIN_FRACTION: f64 = 0.08;
 /// Smallest autoscaled voltage span: 8 mV.
@@ -533,6 +538,34 @@ impl ScopeApp {
         self.meter.reset();
     }
 
+    /// Drop the captured trace. A live stream keeps running and starts again at zero.
+    fn clear_session(&mut self) {
+        self.samples.clear();
+        self.markers.clear();
+        self.selected_marker_id = None;
+        self.dataset_breaks.clear();
+        self.host_time_origin_utc = None;
+        self.timeline_shift_us = 0;
+        self.live_tail_us = None;
+        self.disconnected_at = None;
+        self.view_end = None;
+        self.cursor_time = None;
+        self.voltage = None;
+        self.current = None;
+        self.power = None;
+        self.cc1 = None;
+        self.cc2 = None;
+        self.accumulator.reset();
+        self.meter.reset();
+        self.status = if self.streaming {
+            format!("Streaming at {}", rate_label(self.rate))
+        } else if self.connected {
+            "Connected".to_string()
+        } else {
+            "Session cleared".to_string()
+        };
+    }
+
     /// Place the next capture after the samples already stored.
     fn resume_timeline(&mut self) {
         let Some(disconnected_at) = self.disconnected_at.take() else {
@@ -930,6 +963,55 @@ impl ScopeApp {
         self.buffer_meter(ui);
     }
 
+    /// Connect, session files, and device dialogs, in two equal columns.
+    fn session_buttons(&mut self, ui: &mut egui::Ui) {
+        let height = ui.spacing().interact_size.y;
+        ui.columns(2, |columns| {
+            let label = if self.connected { "Disconnect" } else { "Connect" };
+            if pane_button(&mut columns[0], true, label, height).clicked() {
+                if self.connected {
+                    let _ = self.session.disconnect();
+                } else {
+                    self.status = "Connecting...".to_string();
+                    let _ = self.session.connect(self.rate, self.usb_reset);
+                }
+            }
+            if pane_button(&mut columns[1], true, "Clear session", height)
+                .on_hover_text("Drop the captured trace. A live capture starts again from empty.")
+                .clicked()
+            {
+                self.clear_session();
+            }
+        });
+        ui.columns(2, |columns| {
+            if pane_button(
+                &mut columns[0],
+                !self.samples.is_empty() && !self.file_busy,
+                "Save session",
+                height,
+            )
+            .on_hover_text("Write the waveforms and events to a session file")
+            .clicked()
+            {
+                self.save_session();
+            }
+            if pane_button(&mut columns[1], !self.file_busy, "Load session", height)
+                .on_hover_text("Append a saved session on its real clock. A live capture keeps 5% of the buffer free.")
+                .clicked()
+            {
+                self.load_session();
+            }
+        });
+        ui.columns(2, |columns| {
+            if pane_button(&mut columns[0], self.device.is_some(), "Device Info", height).clicked() {
+                self.device_info_open = true;
+            }
+            if pane_button(&mut columns[1], self.device.is_some(), "PD Info", height).clicked() {
+                self.pd_info_open = true;
+            }
+        });
+    }
+
     fn controls(&mut self, ui: &mut egui::Ui) {
         ui.label(self.status.as_str());
         ui.add_space(8.0);
@@ -943,52 +1025,7 @@ impl ScopeApp {
             "WinUSB does not support USB device reset."
         });
         ui.add_space(8.0);
-
-        if self.connected {
-            if ui.button("Disconnect").clicked() {
-                let _ = self.session.disconnect();
-            }
-        } else if ui.button("Connect").clicked() {
-            self.status = "Connecting...".to_string();
-            let _ = self.session.connect(self.rate, self.usb_reset);
-        }
-
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !self.samples.is_empty() && !self.file_busy,
-                    egui::Button::new("Save session"),
-                )
-                .on_hover_text("Write the waveforms and events to a session file")
-                .clicked()
-            {
-                self.save_session();
-            }
-            if ui
-                .add_enabled(!self.file_busy, egui::Button::new("Load session"))
-                .on_hover_text("Append a saved session on its real clock. A live capture keeps 5% of the buffer free.")
-                .clicked()
-            {
-                self.load_session();
-            }
-        });
-
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(self.device.is_some(), egui::Button::new("Device Info"))
-                .clicked()
-            {
-                self.device_info_open = true;
-            }
-            if ui
-                .add_enabled(self.device.is_some(), egui::Button::new("PD Info"))
-                .clicked()
-            {
-                self.pd_info_open = true;
-            }
-        });
+        self.session_buttons(ui);
         ui.add_space(8.0);
         ui.checkbox(&mut self.autoscroll, "Autoscroll");
         let cursor_was_off = !self.cursor_mode;
@@ -1000,8 +1037,10 @@ impl ScopeApp {
         ui.add_space(8.0);
         ui.label("Sample rate");
         let previous_rate = self.rate;
+        let rate_width = pane_column_width(ui);
         egui::ComboBox::from_id_salt("sample_rate")
             .selected_text(rate_label(self.rate))
+            .width(rate_width)
             .show_ui(ui, |ui| {
                 for rate in RATES {
                     ui.selectable_value(&mut self.rate, rate, rate_label(rate));
@@ -1399,7 +1438,8 @@ impl ScopeApp {
         if scroll == 0.0 {
             return;
         }
-        let next_scale = zoomed_pixels_per_second(self.pixels_per_second, scroll);
+        let floor = minimum_pixels_for_span(self.plot_width, sample_buffer_span(&self.samples));
+        let next_scale = zoomed_pixels_per_second(self.pixels_per_second, scroll, floor);
         if !self.autoscroll
             && let (Some(pointer_x), Some(end), Some(plot_width), Some(plot_left)) =
                 (pointer_x, self.view_end, self.plot_width, self.plot_left)
@@ -1467,16 +1507,15 @@ impl ScopeApp {
         }
         if dragging_overview {
             self.autoscroll = false;
-            if let Some((buf_start, buf_end)) = sample_buffer_span(&self.samples)
-                && let Some(frame) = self.overview_frame
+            if let Some(frame) = self.overview_frame
+                && let Some(map) = overview_map(&self.samples, &self.dataset_breaks, frame.width())
             {
-                let end = self.view_end.unwrap_or(buf_end);
+                let end = self.view_end.unwrap_or(map.end);
                 self.view_end = Some(overview_dragged_view_end(
                     end,
                     delta_x,
                     frame.width(),
-                    buf_start,
-                    buf_end,
+                    &map,
                     self.window_secs,
                 ));
             }
@@ -1571,11 +1610,12 @@ impl ScopeApp {
         let Some(frame) = self.overview_frame else {
             return;
         };
-        let Some((buf_start, buf_end)) = sample_buffer_span(&self.samples) else {
+        let Some(map) = overview_map(&self.samples, &self.dataset_breaks, frame.width()) else {
             return;
         };
-        let time = overview_time_at_x(pointer_x, frame.left(), frame.width(), buf_start, buf_end);
-        self.view_end = Some(overview_centered_view_end(time, buf_start, buf_end, self.window_secs));
+        let fraction = f64::from(((pointer_x - frame.left()) / frame.width().max(1.0)).clamp(0.0, 1.0));
+        let time = map.fraction_to_time(fraction);
+        self.view_end = Some(overview_centered_view_end(time, map.start, map.end, self.window_secs));
         self.autoscroll = false;
     }
 
@@ -1586,7 +1626,7 @@ impl ScopeApp {
         self.overview_frame = Some(frame);
         let painter = ui.ctx().layer_painter(ui.layer_id());
         painter.rect_filled(frame, 0.0, Color32::BLACK);
-        let Some((buf_start, buf_end)) = sample_buffer_span(&self.samples) else {
+        let Some(map) = overview_map(&self.samples, &self.dataset_breaks, frame.width()) else {
             return;
         };
         let columns = (frame.width() as usize).clamp(1, 1200);
@@ -1596,13 +1636,11 @@ impl ScopeApp {
             (Metric::Voltage, VOLTAGE_COLOR),
         ] {
             let points = overview_segments(&self.samples, metric, columns, &self.dataset_breaks);
-            paint_overview_segments(&painter, frame, &points, buf_start, buf_end, color);
+            paint_overview_segments(&painter, frame, &points, &map, color);
         }
-        let view_end = self.view_end.unwrap_or(buf_end);
-        let (left_edge, right_edge) =
-            overview_window_fraction(view_end - self.window_secs, view_end, buf_start, buf_end);
-        let window_left = frame.left() + left_edge as f32 * frame.width();
-        let window_right = frame.left() + right_edge as f32 * frame.width();
+        let view_end = self.view_end.unwrap_or(map.end);
+        let window_left = frame.left() + map.time_to_fraction(view_end - self.window_secs) as f32 * frame.width();
+        let window_right = frame.left() + map.time_to_fraction(view_end) as f32 * frame.width();
         let shade = Color32::from_rgba_unmultiplied(176, 176, 176, 150);
         if window_left > frame.left() {
             painter.rect_filled(
@@ -1616,6 +1654,16 @@ impl ScopeApp {
                 egui::Rect::from_min_max(egui::pos2(window_right, frame.top()), frame.right_bottom()),
                 0.0,
                 shade,
+            );
+        }
+        for piece in &map.pieces {
+            if !piece.collapsed {
+                continue;
+            }
+            let x = frame.left() + ((piece.visual_start + piece.visual_end) * 0.5) as f32 * frame.width();
+            painter.line_segment(
+                [egui::pos2(x, frame.top()), egui::pos2(x, frame.bottom())],
+                egui::Stroke::new(2.0, OVERVIEW_GAP_COLOR),
             );
         }
     }
@@ -1705,6 +1753,17 @@ fn meter_pane_width() -> f32 {
     let columns = format_measurement(Some(-99.99999), "W").chars().count() as f32;
     let text = columns * SPACE_MONO_ADVANCE_EM * METER_VALUE_FONT_SIZE;
     (text + METER_BOX_MARGIN * 2.0 + SIDE_PANEL_INNER_MARGIN * 2.0 + SIDE_PANEL_SEPARATOR).ceil()
+}
+
+fn pane_button(ui: &mut egui::Ui, enabled: bool, label: &str, height: f32) -> egui::Response {
+    let size = egui::vec2(ui.available_width(), height);
+    ui.add_enabled_ui(enabled, |ui| ui.add_sized(size, egui::Button::new(label)))
+        .inner
+}
+
+fn pane_column_width(ui: &egui::Ui) -> f32 {
+    let spacing = ui.spacing().item_spacing.x;
+    (ui.available_width() - spacing) / 2.0
 }
 
 fn meter_text(text: impl Into<String>, size: f32) -> RichText {
@@ -2336,8 +2395,17 @@ fn format_time_axis_label(origin: Option<&DateTime<Utc>>, visible_range: Option<
     let (Some(origin), Some(range)) = (origin, visible_range) else {
         return "Elapsed time (s)".to_string();
     };
-    let center = (*range.start() + *range.end()) * 0.5;
-    format!("Local time · {}", host_time_local(origin, center).format("%b %d, %Y"))
+    let start = host_time_local(origin, *range.start());
+    let end = host_time_local(origin, *range.end());
+    if start.date_naive() != end.date_naive() {
+        format!(
+            "Local time · {} – {}",
+            start.format("%b %d, %Y"),
+            end.format("%b %d, %Y")
+        )
+    } else {
+        format!("Local time · {}", end.format("%b %d, %Y"))
+    }
 }
 
 fn format_event_time(origin: Option<&DateTime<Utc>>, elapsed_seconds: f64) -> String {
@@ -2605,22 +2673,133 @@ fn sample_buffer_span(samples: &VecDeque<MeasurementSample>) -> Option<(f64, f64
     Some((samples.front()?.elapsed_seconds(), samples.back()?.elapsed_seconds()))
 }
 
-/// Fraction of the stored buffer covered by the visible window, clamped to the buffer.
-fn overview_window_fraction(view_start: f64, view_end: f64, buf_start: f64, buf_end: f64) -> (f64, f64) {
-    if buf_end <= buf_start {
-        return (0.0, 1.0);
-    }
-    let span = buf_end - buf_start;
-    (
-        ((view_start - buf_start) / span).clamp(0.0, 1.0),
-        ((view_end - buf_start) / span).clamp(0.0, 1.0),
-    )
+struct OverviewPiece {
+    start: f64,
+    end: f64,
+    visual_start: f64,
+    visual_end: f64,
+    collapsed: bool,
 }
 
-/// Time in the stored buffer at a horizontal position in the overview.
-fn overview_time_at_x(pointer_x: f32, frame_left: f32, frame_width: f32, buf_start: f64, buf_end: f64) -> f64 {
-    let fraction = f64::from(pointer_x - frame_left) / f64::from(frame_width.max(1.0));
-    buf_start + fraction.clamp(0.0, 1.0) * (buf_end - buf_start)
+struct OverviewMap {
+    start: f64,
+    end: f64,
+    pieces: Vec<OverviewPiece>,
+}
+
+impl OverviewMap {
+    fn time_to_fraction(&self, time: f64) -> f64 {
+        let time = time.clamp(self.start, self.end);
+        for (index, piece) in self.pieces.iter().enumerate() {
+            let last = index + 1 == self.pieces.len();
+            if time <= piece.end || last {
+                let span = (piece.end - piece.start).max(f64::EPSILON);
+                let along = ((time - piece.start) / span).clamp(0.0, 1.0);
+                return piece.visual_start + along * (piece.visual_end - piece.visual_start);
+            }
+        }
+        1.0
+    }
+
+    fn fraction_to_time(&self, fraction: f64) -> f64 {
+        let fraction = fraction.clamp(0.0, 1.0);
+        for (index, piece) in self.pieces.iter().enumerate() {
+            let last = index + 1 == self.pieces.len();
+            if fraction <= piece.visual_end || last {
+                let span = (piece.visual_end - piece.visual_start).max(f64::EPSILON);
+                let along = ((fraction - piece.visual_start) / span).clamp(0.0, 1.0);
+                return piece.start + along * (piece.end - piece.start);
+            }
+        }
+        self.end
+    }
+}
+
+fn overview_map(samples: &VecDeque<MeasurementSample>, breaks: &[f64], width_px: f32) -> Option<OverviewMap> {
+    let ranges = dataset_ranges(samples, breaks);
+    let mut segments = Vec::new();
+    for range in ranges {
+        if range.is_empty() {
+            continue;
+        }
+        let start = samples[range.start].elapsed_seconds();
+        let end = samples[range.end - 1].elapsed_seconds();
+        segments.push((start, end.max(start)));
+    }
+    overview_map_from_segments(&segments, width_px)
+}
+
+fn overview_map_from_segments(segments: &[(f64, f64)], width_px: f32) -> Option<OverviewMap> {
+    if segments.is_empty() {
+        return None;
+    }
+    struct RawPiece {
+        start: f64,
+        end: f64,
+        collapsed: bool,
+        duration: f64,
+    }
+    let mut raw = Vec::new();
+    for (index, (start, end)) in segments.iter().enumerate() {
+        if index > 0 {
+            let previous_end = segments[index - 1].1;
+            let gap = *start - previous_end;
+            if gap > 0.0 {
+                let before = (segments[index - 1].1 - segments[index - 1].0).max(0.0);
+                let after = (*end - *start).max(0.0);
+                raw.push(RawPiece {
+                    start: previous_end,
+                    end: *start,
+                    collapsed: gap >= OVERVIEW_LARGE_GAP_SECS || gap > (before + after).max(1.0),
+                    duration: gap,
+                });
+            }
+        }
+        raw.push(RawPiece {
+            start: *start,
+            end: *end,
+            collapsed: false,
+            duration: (*end - *start).max(1.0),
+        });
+    }
+    let width_px = width_px.max(1.0);
+    let collapsed = raw.iter().filter(|piece| piece.collapsed).count() as f32;
+    let mark_px = if collapsed == 0.0 {
+        0.0
+    } else {
+        OVERVIEW_GAP_MARK_PX.min(width_px * 0.5 / collapsed)
+    };
+    let collapsed_px = mark_px * collapsed;
+    let time_px = (width_px - collapsed_px).max(1.0);
+    let time_total: f64 = raw
+        .iter()
+        .filter(|piece| !piece.collapsed)
+        .map(|piece| piece.duration)
+        .sum();
+    let time_total = time_total.max(f64::EPSILON);
+    let mut visual = 0.0;
+    let mut pieces = Vec::with_capacity(raw.len());
+    for (index, piece) in raw.iter().enumerate() {
+        let share = if piece.collapsed {
+            f64::from(mark_px / width_px)
+        } else {
+            f64::from(time_px / width_px) * (piece.duration / time_total)
+        };
+        let visual_end = if index + 1 == raw.len() { 1.0 } else { visual + share };
+        pieces.push(OverviewPiece {
+            start: piece.start,
+            end: piece.end,
+            visual_start: visual,
+            visual_end,
+            collapsed: piece.collapsed,
+        });
+        visual = visual_end;
+    }
+    Some(OverviewMap {
+        start: segments[0].0,
+        end: segments.last().unwrap().1,
+        pieces,
+    })
 }
 
 /// Put `time` at the center of the visible window, keeping the window inside the buffer when it fits.
@@ -2629,17 +2808,11 @@ fn overview_centered_view_end(time: f64, buf_start: f64, buf_end: f64, window_se
 }
 
 /// Dragging the bright region to the right moves the visible window later in time.
-fn overview_dragged_view_end(
-    view_end: f64,
-    drag_x: f32,
-    width: f32,
-    buf_start: f64,
-    buf_end: f64,
-    window_secs: f64,
-) -> f64 {
-    let span = (buf_end - buf_start).max(f64::EPSILON);
-    let moved = view_end + f64::from(drag_x) / f64::from(width.max(1.0)) * span;
-    clamped_view_end(moved, buf_start, buf_end, window_secs)
+fn overview_dragged_view_end(view_end: f64, drag_x: f32, width: f32, map: &OverviewMap, window_secs: f64) -> f64 {
+    let center = view_end - window_secs * 0.5;
+    let visual = map.time_to_fraction(center) + f64::from(drag_x) / f64::from(width.max(1.0));
+    let moved_center = map.fraction_to_time(visual);
+    clamped_view_end(moved_center + window_secs * 0.5, map.start, map.end, window_secs)
 }
 
 /// The left edge never moves before the oldest sample.
@@ -2718,8 +2891,7 @@ fn paint_overview_segments(
     painter: &egui::Painter,
     frame: egui::Rect,
     segments: &[Vec<[f64; 2]>],
-    buf_start: f64,
-    buf_end: f64,
+    map: &OverviewMap,
     color: Color32,
 ) {
     let mut min_y = f64::INFINITY;
@@ -2734,7 +2906,7 @@ fn paint_overview_segments(
         return;
     }
     for segment in segments {
-        paint_overview_curve(painter, frame, segment, buf_start, buf_end, color, (min_y, max_y));
+        paint_overview_curve(painter, frame, segment, map, color, (min_y, max_y));
     }
 }
 
@@ -2742,8 +2914,7 @@ fn paint_overview_curve(
     painter: &egui::Painter,
     frame: egui::Rect,
     points: &[[f64; 2]],
-    buf_start: f64,
-    buf_end: f64,
+    map: &OverviewMap,
     color: Color32,
     y_span: (f64, f64),
 ) {
@@ -2752,12 +2923,11 @@ fn paint_overview_curve(
         return;
     }
     let span_y = (max_y - min_y).max(f64::EPSILON);
-    let span_x = (buf_end - buf_start).max(f64::EPSILON);
     let plot = frame.shrink(1.0);
     let screen = points
         .iter()
         .map(|point| {
-            let x = plot.left() + ((point[0] - buf_start) / span_x).clamp(0.0, 1.0) as f32 * plot.width();
+            let x = plot.left() + map.time_to_fraction(point[0]) as f32 * plot.width();
             let y = plot.bottom() - ((point[1] - min_y) / span_y).clamp(0.0, 1.0) as f32 * plot.height();
             egui::pos2(x, y)
         })
@@ -3021,9 +3191,24 @@ fn minimum_window_size() -> [f32; 2] {
 }
 
 /// Scrolling up increases pixels per second. The result stays inside the zoom limits.
-fn zoomed_pixels_per_second(current: f64, scroll_y: f32) -> f64 {
+fn zoomed_pixels_per_second(current: f64, scroll_y: f32, min_pixels: f64) -> f64 {
     let factor = (-f64::from(scroll_y) * SCROLL_ZOOM_SPEED).exp();
-    (current * factor).clamp(MIN_PIXELS_PER_SECOND, MAX_PIXELS_PER_SECOND)
+    (current * factor).clamp(min_pixels, MAX_PIXELS_PER_SECOND)
+}
+
+/// The furthest zoom-out that still fits the stored span in the plot.
+fn minimum_pixels_for_span(plot_width: Option<f64>, span: Option<(f64, f64)>) -> f64 {
+    let Some(width) = plot_width else {
+        return MIN_PIXELS_PER_SECOND;
+    };
+    let Some((start, end)) = span else {
+        return MIN_PIXELS_PER_SECOND;
+    };
+    let duration = end - start;
+    if duration <= 1.0 {
+        return MIN_PIXELS_PER_SECOND;
+    }
+    (width / duration).clamp(1.0e-6, MIN_PIXELS_PER_SECOND)
 }
 
 /// Move the right edge so `pointer_x` still marks the same time at `next_scale`.
@@ -3061,12 +3246,12 @@ mod tests {
         clamped_cursor, clamped_view_end, clock_grid_steps, crosses_dataset_break, cursor_label_on_left, cursor_value,
         explorer_viewport_size, fitted_cursor_font_size, format_axis_time, format_engineering_tick, format_event_time,
         format_max_power, format_measurement, format_temperature, host_time_grid_marks, host_time_utc, identity_label,
-        initial_window_size, layer_covers_plots, meter_pane_width, minimum_window_size, overview_centered_view_end,
-        overview_dragged_view_end, overview_time_at_x, overview_window_fraction, panned_view_end, pd_timeline_marker,
-        pd_timeline_time, pointer_blocks_plots, protocol_label, samples_per_meter_update, scaled_y_range, series,
-        split_series, stored_elapsed_us, time_at_pointer, timeline_origin_utc, timeline_shift_after_gap,
-        trim_to_max_samples, usb_vendor_name, visible_sample_range, wall_gap_us, zoomed_pixels_per_second,
-        zoomed_view_end_at_pointer,
+        initial_window_size, layer_covers_plots, meter_pane_width, minimum_pixels_for_span, minimum_window_size,
+        overview_centered_view_end, overview_dragged_view_end, overview_map_from_segments, panned_view_end,
+        pd_timeline_marker, pd_timeline_time, pointer_blocks_plots, protocol_label, samples_per_meter_update,
+        scaled_y_range, series, split_series, stored_elapsed_us, time_at_pointer, timeline_origin_utc,
+        timeline_shift_after_gap, trim_to_max_samples, usb_vendor_name, visible_sample_range, wall_gap_us,
+        zoomed_pixels_per_second, zoomed_view_end_at_pointer,
     };
     use km003c_lib::MeasurementSample;
     use km003c_lib::Metric;
@@ -3201,6 +3386,10 @@ mod tests {
         assert!(
             format_axis_time(Some(&origin), hundredth.value, hundredth.step_size, &(0.0..=0.05)).ends_with("59.85")
         );
+        let across_days = format_axis_time(Some(&origin), 0.0, 3_600.0, &(0.0..=86_400.0));
+        assert!(across_days.contains('-'), "{across_days}");
+        let same_day = format_axis_time(Some(&origin), 0.0, 1.0, &(0.0..=10.0));
+        assert!(!same_day.contains('-'), "{same_day}");
     }
 
     #[test]
@@ -3265,16 +3454,21 @@ mod tests {
 
     #[test]
     fn mouse_wheel_changes_pixels_per_second_for_the_whole_scope() {
-        let zoomed_in = zoomed_pixels_per_second(PIXELS_PER_SECOND, -100.0);
-        let zoomed_out = zoomed_pixels_per_second(PIXELS_PER_SECOND, 100.0);
+        let zoomed_in = zoomed_pixels_per_second(PIXELS_PER_SECOND, -100.0, MIN_PIXELS_PER_SECOND);
+        let zoomed_out = zoomed_pixels_per_second(PIXELS_PER_SECOND, 100.0, MIN_PIXELS_PER_SECOND);
         assert!(zoomed_in > PIXELS_PER_SECOND);
         assert!(zoomed_out < PIXELS_PER_SECOND);
         assert_eq!(
-            zoomed_pixels_per_second(MAX_PIXELS_PER_SECOND, -1_000.0),
+            zoomed_pixels_per_second(MAX_PIXELS_PER_SECOND, -1_000.0, MIN_PIXELS_PER_SECOND),
             MAX_PIXELS_PER_SECOND
         );
         assert_eq!(
-            zoomed_pixels_per_second(MIN_PIXELS_PER_SECOND, 1_000.0),
+            zoomed_pixels_per_second(MIN_PIXELS_PER_SECOND, 1_000.0, MIN_PIXELS_PER_SECOND),
+            MIN_PIXELS_PER_SECOND
+        );
+        assert!(minimum_pixels_for_span(Some(800.0), Some((0.0, 86_400.0))) < MIN_PIXELS_PER_SECOND);
+        assert_eq!(
+            minimum_pixels_for_span(Some(800.0), Some((0.0, 8.0))),
             MIN_PIXELS_PER_SECOND
         );
     }
@@ -3445,14 +3639,13 @@ mod tests {
 
     #[test]
     fn overview_box_tracks_the_visible_window() {
-        let (left, right) = overview_window_fraction(40.0, 50.0, 0.0, 100.0);
-        assert!((left - 0.4).abs() < 1e-9);
-        assert!((right - 0.5).abs() < 1e-9);
-        let (zoomed_out_left, zoomed_out_right) = overview_window_fraction(30.0, 50.0, 0.0, 100.0);
-        assert!((zoomed_out_right - zoomed_out_left) > (right - left));
-        assert!((overview_dragged_view_end(50.0, 10.0, 100.0, 0.0, 100.0, 10.0) - 60.0).abs() < 1e-9);
-        assert!((overview_dragged_view_end(98.0, 10.0, 100.0, 0.0, 100.0, 10.0) - 100.0).abs() < 1e-9);
-        assert!((overview_time_at_x(80.0, 0.0, 100.0, 0.0, 100.0) - 80.0).abs() < 1e-9);
+        let map = overview_map_from_segments(&[(0.0, 100.0)], 100.0).unwrap();
+        assert!((overview_dragged_view_end(50.0, 10.0, 100.0, &map, 10.0) - 60.0).abs() < 1e-6);
+        assert!((overview_dragged_view_end(98.0, 10.0, 100.0, &map, 10.0) - 100.0).abs() < 1e-6);
+        let gapped = overview_map_from_segments(&[(0.0, 10.0), (3_610.0, 3_620.0)], 100.0).unwrap();
+        let gap = gapped.time_to_fraction(3_610.0) - gapped.time_to_fraction(10.0);
+        assert!((gap - 0.08).abs() < 0.02, "{gap}");
+        assert!(gapped.time_to_fraction(10.0) > 0.4);
         assert!((overview_centered_view_end(80.0, 0.0, 100.0, 10.0) - 85.0).abs() < 1e-9);
         assert!((overview_centered_view_end(2.0, 0.0, 100.0, 10.0) - 10.0).abs() < 1e-9);
         assert!((overview_centered_view_end(98.0, 0.0, 100.0, 10.0) - 100.0).abs() < 1e-9);
