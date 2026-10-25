@@ -173,6 +173,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         overview_press: None,
         window_has_pointer: false,
         usb_reset,
+        disconnected_at: None,
+        timeline_shift_us: 0,
+        dataset_breaks: Vec::new(),
     };
 
     let [width, height] = initial_window_size();
@@ -245,6 +248,12 @@ struct ScopeApp {
     /// The current press started on a floating window, so it must not pan the strips.
     window_has_pointer: bool,
     usb_reset: bool,
+    /// Wall time of the latest disconnect, while captured samples are still in the buffer.
+    disconnected_at: Option<DateTime<Utc>>,
+    /// Added to device elapsed time so a later connection continues after the previous capture.
+    timeline_shift_us: u64,
+    /// Elapsed time of the last sample before each reconnect gap.
+    dataset_breaks: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,21 +343,21 @@ impl ScopeApp {
                 }
                 SessionEvent::Samples(samples) => {
                     let rate = self.rate;
+                    let shift_us = self.timeline_shift_us;
                     let mut newest_elapsed = None;
                     for sample in samples {
-                        let Some(measurement) = self.accumulator.push(sample, rate) else {
+                        let Some(mut measurement) = self.accumulator.push(sample, rate) else {
                             continue;
                         };
+                        measurement.elapsed_us = stored_elapsed_us(measurement.elapsed_us, shift_us);
                         newest_elapsed = Some(measurement.elapsed_seconds());
+                        let voltage = Metric::Voltage.value(&measurement);
+                        let current = Metric::SignedCurrent.value(&measurement);
+                        let power = Metric::SignedPower.value(&measurement);
+                        let cc1 = Metric::Cc1.value(&measurement);
+                        let cc2 = Metric::Cc2.value(&measurement);
                         self.samples.push_back(measurement);
-                        if let Some(reading) = self.meter.push(
-                            rate,
-                            Metric::Voltage.value(&measurement),
-                            Metric::SignedCurrent.value(&measurement),
-                            Metric::SignedPower.value(&measurement),
-                            Metric::Cc1.value(&measurement),
-                            Metric::Cc2.value(&measurement),
-                        ) {
+                        if let Some(reading) = self.meter.push(rate, voltage, current, power, cc1, cc2) {
                             self.voltage = Some(reading.voltage);
                             self.current = Some(reading.current);
                             self.power = Some(reading.power);
@@ -367,7 +376,8 @@ impl ScopeApp {
                     self.temperature_c = Some(adc.temperature.get::<degree_celsius>());
                 }
                 SessionEvent::StreamingStarted(rate) => {
-                    if let Some(time) = self.samples.back().map(|sample| sample.elapsed_seconds()) {
+                    let reconnecting = self.disconnected_at.is_some();
+                    if !reconnecting && let Some(time) = self.samples.back().map(|sample| sample.elapsed_seconds()) {
                         self.push_marker(
                             time,
                             TimelineMarkerSpec {
@@ -380,8 +390,10 @@ impl ScopeApp {
                     }
                     self.streaming = true;
                     self.rate = rate;
-                    // A rate change restarts the device counter. Keep the samples
-                    // and the elapsed time so the new points continue the trace.
+                    // A fresh stream has its own sequence counter. After a disconnect,
+                    // move the elapsed clock forward by the time spent away so the new
+                    // samples land at the tail, with a gap before them.
+                    self.resume_timeline();
                     self.accumulator.reset_continuity();
                     self.meter.reset();
                     self.status = format!("Streaming at {}", rate_label(rate));
@@ -473,12 +485,27 @@ impl ScopeApp {
         self.cc1 = None;
         self.cc2 = None;
         self.temperature_c = None;
-        self.samples.clear();
-        self.markers.clear();
-        self.selected_marker_id = None;
-        self.host_time_origin_utc = None;
-        self.accumulator = MeasurementAccumulator::default();
+        if self.disconnected_at.is_none() && !self.samples.is_empty() {
+            self.disconnected_at = Some(Utc::now());
+        }
+        self.accumulator.reset_continuity();
         self.meter.reset();
+    }
+
+    /// Place the next capture after the samples already stored.
+    fn resume_timeline(&mut self) {
+        let Some(disconnected_at) = self.disconnected_at.take() else {
+            return;
+        };
+        let Some(last) = self.samples.back().map(|sample| sample.elapsed_seconds()) else {
+            return;
+        };
+        let gap_us = wall_gap_us(disconnected_at, Utc::now());
+        if gap_us == 0 {
+            return;
+        }
+        self.dataset_breaks.push(last);
+        self.timeline_shift_us = timeline_shift_after_gap(self.timeline_shift_us, gap_us);
     }
 
     fn trim_window(&mut self) {
@@ -486,8 +513,10 @@ impl ScopeApp {
         let Some(oldest) = self.samples.front().map(|sample| sample.elapsed_seconds()) else {
             self.markers.clear();
             self.selected_marker_id = None;
+            self.dataset_breaks.clear();
             return;
         };
+        self.dataset_breaks.retain(|gap| *gap >= oldest);
         while self
             .markers
             .front()
@@ -927,6 +956,7 @@ impl ScopeApp {
                     &points,
                     link,
                     time.clone(),
+                    &self.dataset_breaks,
                     TraceOverlay {
                         marker_lane,
                         cursor,
@@ -1104,7 +1134,7 @@ impl ScopeApp {
             .is_some_and(|end| cursor_label_on_left(time, end, self.pixels_per_second));
         Some(CursorMark {
             time,
-            value: cursor_value(&self.samples, metric, time),
+            value: cursor_value(&self.samples, metric, time, &self.dataset_breaks),
             label_on_left,
         })
     }
@@ -1160,8 +1190,8 @@ impl ScopeApp {
             (Metric::SignedCurrent, CURRENT_COLOR),
             (Metric::Voltage, VOLTAGE_COLOR),
         ] {
-            let points = overview_envelope(&self.samples, metric, columns);
-            paint_overview_curve(&painter, frame, &points, buf_start, buf_end, color);
+            let points = overview_segments(&self.samples, metric, columns, &self.dataset_breaks);
+            paint_overview_segments(&painter, frame, &points, buf_start, buf_end, color);
         }
         let view_end = self.view_end.unwrap_or(buf_end);
         let (left_edge, right_edge) =
@@ -1419,6 +1449,7 @@ fn trace_plot(
     points: &[[f64; 2]],
     link: egui::Id,
     time: Option<RangeInclusive<f64>>,
+    breaks: &[f64],
     overlay: TraceOverlay<'_>,
 ) -> egui::Rect {
     let width = ui.available_width();
@@ -1461,11 +1492,17 @@ fn trace_plot(
         ) {
             plot_ui.set_plot_bounds_y(range);
         }
-        plot_ui.line(
-            Line::new(strip.id, PlotPoints::new(points.to_vec()))
-                .color(strip.color)
-                .width(1.8),
-        );
+        let segments = split_series(points, breaks);
+        for (index, segment) in segments.iter().enumerate() {
+            if segment.len() < 2 {
+                continue;
+            }
+            plot_ui.line(
+                Line::new(format!("{}-{index}", strip.id), PlotPoints::new(segment.clone()))
+                    .color(strip.color)
+                    .width(1.8),
+            );
+        }
         if let Some(cursor) = &overlay.cursor {
             plot_ui.vline(
                 egui_plot::VLine::new(format!("{}-cursor", strip.id), cursor.time)
@@ -2208,15 +2245,23 @@ fn clamped_view_end(view_end: f64, buf_start: f64, buf_end: f64, window_secs: f6
 }
 
 /// Min/max of each screen column, so the full buffer stays readable.
-fn overview_envelope(samples: &VecDeque<MeasurementSample>, metric: Metric, columns: usize) -> Vec<[f64; 2]> {
-    let len = samples.len();
+fn overview_envelope(
+    samples: &VecDeque<MeasurementSample>,
+    metric: Metric,
+    columns: usize,
+    range: Range<usize>,
+) -> Vec<[f64; 2]> {
+    let len = range.len();
     if len == 0 || columns == 0 {
         return Vec::new();
     }
+    let columns = columns.min(len);
     let mut points = Vec::with_capacity(columns * 2);
     for column in 0..columns {
-        let start = column * len / columns;
-        let end = ((column + 1) * len / columns).max(start + 1).min(len);
+        let start = range.start + column * len / columns;
+        let end = (range.start + (column + 1) * len / columns)
+            .max(start + 1)
+            .min(range.end);
         let mut min_y = f64::INFINITY;
         let mut max_y = f64::NEG_INFINITY;
         let t0 = samples[start].elapsed_seconds();
@@ -2239,6 +2284,49 @@ fn overview_envelope(samples: &VecDeque<MeasurementSample>, metric: Metric, colu
     points
 }
 
+/// One overview trace per capture, so a reconnect gap is empty space on the time axis.
+fn overview_segments(
+    samples: &VecDeque<MeasurementSample>,
+    metric: Metric,
+    columns: usize,
+    breaks: &[f64],
+) -> Vec<Vec<[f64; 2]>> {
+    let total = samples.len();
+    dataset_ranges(samples, breaks)
+        .into_iter()
+        .filter(|range| range.len() >= 2)
+        .map(|range| {
+            let share = (columns * range.len() / total.max(1)).clamp(1, columns.max(1));
+            overview_envelope(samples, metric, share, range)
+        })
+        .filter(|points| points.len() >= 2)
+        .collect()
+}
+
+fn paint_overview_segments(
+    painter: &egui::Painter,
+    frame: egui::Rect,
+    segments: &[Vec<[f64; 2]>],
+    buf_start: f64,
+    buf_end: f64,
+    color: Color32,
+) {
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for segment in segments {
+        for point in segment {
+            min_y = min_y.min(point[1]);
+            max_y = max_y.max(point[1]);
+        }
+    }
+    if !min_y.is_finite() {
+        return;
+    }
+    for segment in segments {
+        paint_overview_curve(painter, frame, segment, buf_start, buf_end, color, (min_y, max_y));
+    }
+}
+
 fn paint_overview_curve(
     painter: &egui::Painter,
     frame: egui::Rect,
@@ -2246,17 +2334,10 @@ fn paint_overview_curve(
     buf_start: f64,
     buf_end: f64,
     color: Color32,
+    y_span: (f64, f64),
 ) {
-    if points.len() < 2 {
-        return;
-    }
-    let mut min_y = f64::INFINITY;
-    let mut max_y = f64::NEG_INFINITY;
-    for point in points {
-        min_y = min_y.min(point[1]);
-        max_y = max_y.max(point[1]);
-    }
-    if !min_y.is_finite() {
+    let (min_y, max_y) = y_span;
+    if points.len() < 2 || !min_y.is_finite() {
         return;
     }
     let span_y = (max_y - min_y).max(f64::EPSILON);
@@ -2318,8 +2399,73 @@ fn cursor_label_on_left(cursor: f64, view_end: f64, pixels_per_second: f64) -> b
     (view_end - cursor) * pixels_per_second < CURSOR_LABEL_MARGIN
 }
 
+/// Elapsed microseconds stored on a sample. `shift_us` is the reconnect gap accumulated so far.
+fn stored_elapsed_us(raw_elapsed_us: u64, shift_us: u64) -> u64 {
+    raw_elapsed_us.saturating_add(shift_us)
+}
+
+fn timeline_shift_after_gap(shift_us: u64, gap_us: u64) -> u64 {
+    shift_us.saturating_add(gap_us)
+}
+
+fn wall_gap_us(disconnected_at: DateTime<Utc>, resumed_at: DateTime<Utc>) -> u64 {
+    resumed_at
+        .signed_duration_since(disconnected_at)
+        .num_microseconds()
+        .unwrap_or(0)
+        .max(0) as u64
+}
+
+/// True when `left` and `right` sit on opposite sides of a reconnect gap.
+fn crosses_dataset_break(left: f64, right: f64, breaks: &[f64]) -> bool {
+    let index = breaks.partition_point(|gap| *gap < left);
+    index < breaks.len() && breaks[index] < right
+}
+
+/// Index ranges of samples that belong to one continuous capture.
+fn dataset_ranges(samples: &VecDeque<MeasurementSample>, breaks: &[f64]) -> Vec<Range<usize>> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for index in 1..samples.len() {
+        let previous = samples[index - 1].elapsed_seconds();
+        let time = samples[index].elapsed_seconds();
+        if crosses_dataset_break(previous, time, breaks) {
+            ranges.push(start..index);
+            start = index;
+        }
+    }
+    ranges.push(start..samples.len());
+    ranges
+}
+
+/// Split a polyline so a reconnect gap is not drawn as a ramp.
+fn split_series(points: &[[f64; 2]], breaks: &[f64]) -> Vec<Vec<[f64; 2]>> {
+    if points.is_empty() {
+        return Vec::new();
+    }
+    let mut segments = Vec::new();
+    let mut segment: Vec<[f64; 2]> = Vec::new();
+    for point in points {
+        if let Some(previous) = segment.last()
+            && crosses_dataset_break(previous[0], point[0], breaks)
+        {
+            segments.push(std::mem::take(&mut segment));
+        }
+        segment.push(*point);
+    }
+    if !segment.is_empty() {
+        segments.push(segment);
+    }
+    segments
+}
+
 /// Curve value at `time`, linearly between the surrounding samples.
-fn cursor_value(samples: &VecDeque<MeasurementSample>, metric: Metric, time: f64) -> Option<f64> {
+///
+/// A time that falls in a reconnect gap has no value. The two captures are not one ramp.
+fn cursor_value(samples: &VecDeque<MeasurementSample>, metric: Metric, time: f64, breaks: &[f64]) -> Option<f64> {
     if samples.is_empty() {
         return None;
     }
@@ -2332,6 +2478,9 @@ fn cursor_value(samples: &VecDeque<MeasurementSample>, metric: Metric, time: f64
     }
     let left = &samples[index - 1];
     let right = &samples[index];
+    if crosses_dataset_break(left.elapsed_seconds(), right.elapsed_seconds(), breaks) {
+        return None;
+    }
     Some(interpolated_value(
         left.elapsed_seconds(),
         metric.value(left),
@@ -2465,14 +2614,15 @@ mod tests {
         MAX_PIXELS_PER_SECOND, MAX_SAMPLES, MIN_PIXELS_PER_SECOND, MIN_VOLTAGE_SPAN, MIN_Y_SPAN, MeterAverage,
         OVERVIEW_HEIGHT, PIXELS_PER_SECOND, STRIP_GAP_BETWEEN, STRIP_HEIGHT, TimelineCategory, TimelineMarkerSpec,
         Y_MARGIN_FRACTION, axis_fraction_digits, buffer_fraction, buffer_meter_label, centered_view_end,
-        clamped_cursor, clamped_view_end, clock_grid_steps, cursor_label_on_left, cursor_value, explorer_viewport_size,
-        fitted_cursor_font_size, format_axis_time, format_engineering_tick, format_event_time, format_max_power,
-        format_measurement, format_temperature, host_time_grid_marks, host_time_utc, identity_label,
+        clamped_cursor, clamped_view_end, clock_grid_steps, crosses_dataset_break, cursor_label_on_left, cursor_value,
+        explorer_viewport_size, fitted_cursor_font_size, format_axis_time, format_engineering_tick, format_event_time,
+        format_max_power, format_measurement, format_temperature, host_time_grid_marks, host_time_utc, identity_label,
         initial_window_size, layer_covers_plots, meter_pane_width, minimum_window_size, overview_centered_view_end,
         overview_dragged_view_end, overview_time_at_x, overview_window_fraction, panned_view_end, pd_timeline_marker,
         pd_timeline_time, pointer_blocks_plots, protocol_label, samples_per_meter_update, scaled_y_range, series,
-        time_at_pointer, timeline_origin_utc, trim_to_max_samples, usb_vendor_name, visible_sample_range,
-        zoomed_pixels_per_second, zoomed_view_end_at_pointer,
+        split_series, stored_elapsed_us, time_at_pointer, timeline_origin_utc, timeline_shift_after_gap,
+        trim_to_max_samples, usb_vendor_name, visible_sample_range, wall_gap_us, zoomed_pixels_per_second,
+        zoomed_view_end_at_pointer,
     };
     use km003c_lib::MeasurementSample;
     use km003c_lib::Metric;
@@ -2804,11 +2954,31 @@ mod tests {
             voltage_sample(1_000_000, 20.0),
             voltage_sample(2_000_000, 0.0),
         ]);
-        let at = |time| cursor_value(&samples, Metric::Voltage, time).unwrap();
+        let at = |time| cursor_value(&samples, Metric::Voltage, time, &[]).unwrap();
         assert!((at(0.5) - 15.0).abs() < 1e-9);
         assert!((at(-1.0) - 10.0).abs() < 1e-9);
         assert!((at(3.0) - 0.0).abs() < 1e-9);
-        assert!(cursor_value(&VecDeque::new(), Metric::Voltage, 1.0).is_none());
+        assert!(cursor_value(&VecDeque::new(), Metric::Voltage, 1.0, &[]).is_none());
+        assert!(cursor_value(&samples, Metric::Voltage, 1.5, &[1.0]).is_none());
+    }
+
+    #[test]
+    fn reconnect_appends_after_a_gap() {
+        let disconnected = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let resumed = disconnected + chrono::TimeDelta::seconds(5);
+        let gap_us = wall_gap_us(disconnected, resumed);
+        assert_eq!(gap_us, 5_000_000);
+        let shift = timeline_shift_after_gap(1_000_000, gap_us);
+        assert_eq!(stored_elapsed_us(0, shift), 6_000_000);
+        assert_eq!(stored_elapsed_us(20_000, shift), 6_020_000);
+
+        let points = [[0.0, 1.0], [1.0, 2.0], [6.0, 3.0], [6.02, 4.0]];
+        let segments = split_series(&points, &[1.0]);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0], vec![[0.0, 1.0], [1.0, 2.0]]);
+        assert_eq!(segments[1], vec![[6.0, 3.0], [6.02, 4.0]]);
+        assert!(!crosses_dataset_break(0.0, 1.0, &[1.0]));
+        assert!(crosses_dataset_break(1.0, 6.0, &[1.0]));
     }
 
     #[test]
