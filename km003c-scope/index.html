@@ -16,6 +16,7 @@
   <div id="notice">Loading KM003C scope…</div>
   <canvas id="km003c-scope"></canvas>
   <script>
+    document.getElementById('km003c-scope').addEventListener('contextmenu', (event) => event.preventDefault());
     if (!isSecureContext || !navigator.usb) {
       document.getElementById('notice').textContent =
         'WebUSB requires Chrome or Edge on desktop, with HTTPS or localhost. Firefox and Safari do not support WebUSB.';

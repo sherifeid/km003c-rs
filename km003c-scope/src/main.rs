@@ -1368,7 +1368,8 @@ impl ScopeApp {
         ui.add_space(8.0);
         ui.checkbox(&mut self.autoscroll, "Autoscroll");
         let cursor_was_off = !self.cursor_mode;
-        ui.checkbox(&mut self.cursor_mode, "Cursor");
+        ui.checkbox(&mut self.cursor_mode, "Cursor")
+            .on_hover_text("Right-click a plot to place the cursor, and drag with the right button to move it. Left-drag moves the time window.");
         if self.cursor_mode && cursor_was_off {
             self.cursor_time = self.view_end.map(|end| end - self.window_secs * 0.5);
         }
@@ -1789,21 +1790,35 @@ impl ScopeApp {
         self.window_secs = plot_width / self.pixels_per_second;
     }
 
-    /// Dragging moves every strip along time and leaves Autoscroll off.
+    /// Left-drag moves every strip along time and leaves Autoscroll off.
     ///
-    /// Cursor mode keeps Autoscroll. The marker sits on the time under the pointer.
+    /// That pan is independent of the cursor. A right-click on the strips turns
+    /// the cursor on at that time, and holding the right button drags it.
     /// With Autoscroll on, the first sample stays on the left until the trace fills
     /// the window, and then the right edge follows the newest sample.
     fn place_time_window(&mut self, ui: &egui::Ui) -> bool {
         let rect = ui.available_rect_before_wrap();
-        let (primary_down, primary_pressed, primary_clicked, delta_x, origin, pointer_x) = ui.input(|input| {
+        let (
+            primary_down,
+            primary_pressed,
+            primary_clicked,
+            secondary_down,
+            secondary_clicked,
+            delta_x,
+            origin,
+            pointer_x,
+            interact_pos,
+        ) = ui.input(|input| {
             (
                 input.pointer.primary_down(),
                 input.pointer.primary_pressed(),
                 input.pointer.primary_clicked(),
+                input.pointer.secondary_down(),
+                input.pointer.secondary_clicked(),
                 input.pointer.delta().x,
                 input.pointer.press_origin(),
                 input.pointer.latest_pos().map(|pos| pos.x),
+                input.pointer.interact_pos(),
             )
         });
         let origin_on_window = origin.is_some_and(|pos| {
@@ -1811,7 +1826,11 @@ impl ScopeApp {
                 .layer_id_at(pos)
                 .is_some_and(|layer| layer_covers_plots(layer.order))
         });
-        self.window_has_pointer = pointer_blocks_plots(self.window_has_pointer, primary_down, origin_on_window);
+        self.window_has_pointer = pointer_blocks_plots(
+            self.window_has_pointer,
+            primary_down || secondary_down,
+            origin_on_window,
+        );
         if !self.window_has_pointer {
             self.begin_overview_gesture(primary_pressed, origin);
         }
@@ -1820,8 +1839,8 @@ impl ScopeApp {
             || origin.is_some_and(|pos| self.overview_frame.is_some_and(|frame| frame.contains(pos)));
         let drag_started_on_plots = origin.is_some_and(|origin| rect.contains(origin)) && !on_overview;
         let interacting_with_plots = drag_started_on_plots && !self.window_has_pointer;
-        let placing_cursor = self.cursor_mode && primary_down && interacting_with_plots;
-        let panning = primary_down && interacting_with_plots && delta_x != 0.0 && !self.cursor_mode;
+        let moving_cursor = secondary_down && interacting_with_plots;
+        let panning = primary_down && interacting_with_plots && delta_x != 0.0 && !moving_cursor;
         if self.autoscroll
             && !panning
             && !dragging_overview
@@ -1856,18 +1875,22 @@ impl ScopeApp {
             self.overview_grabbed = false;
             self.overview_press = None;
         }
-        if placing_cursor {
-            if let (Some(pointer_x), Some(end)) = (pointer_x, self.view_end) {
+        if moving_cursor {
+            self.cursor_mode = true;
+            if let Some(pointer_x) = pointer_x {
                 let plot_left = self.plot_left.unwrap_or(rect.left() + AXIS_THICKNESS);
-                self.cursor_time = Some(time_at_pointer(
-                    pointer_x,
-                    plot_left,
-                    end,
-                    self.window_secs,
-                    self.pixels_per_second,
-                ));
+                self.place_cursor_at_pointer(pointer_x, plot_left);
             }
-            return true;
+        } else if secondary_clicked
+            && !self.window_has_pointer
+            && let Some(pos) = interact_pos
+        {
+            let on_overview_click = self.overview_frame.is_some_and(|frame| frame.contains(pos));
+            if rect.contains(pos) && !on_overview_click {
+                self.cursor_mode = true;
+                let plot_left = self.plot_left.unwrap_or(rect.left() + AXIS_THICKNESS);
+                self.place_cursor_at_pointer(pos.x, plot_left);
+            }
         }
         if self.cursor_mode && self.cursor_time.is_none() {
             self.cursor_time = self.view_end.map(|end| end - self.window_secs * 0.5);
@@ -1879,6 +1902,19 @@ impl ScopeApp {
             return true;
         }
         false
+    }
+
+    fn place_cursor_at_pointer(&mut self, pointer_x: f32, plot_left: f32) {
+        let Some(end) = self.view_end else {
+            return;
+        };
+        self.cursor_time = Some(time_at_pointer(
+            pointer_x,
+            plot_left,
+            end,
+            self.window_secs,
+            self.pixels_per_second,
+        ));
     }
 
     /// Keep the visible window from starting before the oldest sample.
@@ -3306,8 +3342,8 @@ fn pointer_over_floating_window(ui: &egui::Ui) -> bool {
 }
 
 /// A press that starts on a floating window keeps blocking the strips until release.
-fn pointer_blocks_plots(blocked: bool, primary_down: bool, origin_on_window: bool) -> bool {
-    primary_down && (blocked || origin_on_window)
+fn pointer_blocks_plots(blocked: bool, button_down: bool, origin_on_window: bool) -> bool {
+    button_down && (blocked || origin_on_window)
 }
 
 /// Time at a screen position, clamped to the visible window.
