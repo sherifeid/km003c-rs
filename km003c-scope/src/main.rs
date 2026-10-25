@@ -53,6 +53,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, info};
 use tracing_subscriber::prelude::*;
 
+mod session_file;
+
 const VOLTAGE_COLOR: Color32 = Color32::from_rgb(80, 220, 120);
 const CURRENT_COLOR: Color32 = Color32::from_rgb(90, 170, 255);
 const POWER_COLOR: Color32 = Color32::from_rgb(255, 176, 64);
@@ -130,6 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting KM003C scope");
 
     let (session, events) = Session::spawn();
+    let (file_tx, file_rx) = std::sync::mpsc::channel();
     let rate = GraphSampleRate::Sps50;
     // WinUSB cannot reset devices, and macOS handles re-enumeration badly.
     let usb_reset = USB_RESET_SUPPORTED && !cfg!(target_os = "macos");
@@ -175,7 +178,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         usb_reset,
         disconnected_at: None,
         timeline_shift_us: 0,
+        live_tail_us: None,
         dataset_breaks: Vec::new(),
+        file_tx,
+        file_rx,
+        file_busy: false,
     };
 
     let [width, height] = initial_window_size();
@@ -196,6 +203,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     )
     .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
+}
+
+enum FileMessage {
+    Saved(std::path::PathBuf),
+    Failed(String),
+    Loaded(session_file::SessionData),
 }
 
 struct ScopeApp {
@@ -251,9 +264,14 @@ struct ScopeApp {
     /// Wall time of the latest disconnect, while captured samples are still in the buffer.
     disconnected_at: Option<DateTime<Utc>>,
     /// Added to device elapsed time so a later connection continues after the previous capture.
-    timeline_shift_us: u64,
+    timeline_shift_us: i64,
+    /// Elapsed time of the newest sample received from the live device.
+    live_tail_us: Option<u64>,
     /// Elapsed time of the last sample before each reconnect gap.
     dataset_breaks: Vec<f64>,
+    file_tx: std::sync::mpsc::Sender<FileMessage>,
+    file_rx: std::sync::mpsc::Receiver<FileMessage>,
+    file_busy: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,6 +300,24 @@ impl TimelineCategory {
             Self::Warning => 3,
         }
     }
+
+    const fn as_code(self) -> u8 {
+        match self {
+            Self::Connectivity => 0,
+            Self::Protocol => 1,
+            Self::Warning => 2,
+            Self::Info => 3,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            0 => Self::Connectivity,
+            1 => Self::Protocol,
+            2 => Self::Warning,
+            _ => Self::Info,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -289,8 +325,8 @@ struct TimelineMarker {
     id: u64,
     elapsed_seconds: f64,
     category: TimelineCategory,
-    label: &'static str,
-    name: &'static str,
+    label: String,
+    name: String,
     details: String,
 }
 
@@ -304,6 +340,10 @@ struct TimelineMarkerSpec {
 impl eframe::App for ScopeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.poll_file_ops();
+        if self.file_busy {
+            ui.ctx().request_repaint();
+        }
         let repaint = if self.streaming { 16 } else { 100 };
         ui.ctx().request_repaint_after(Duration::from_millis(repaint));
 
@@ -351,12 +391,13 @@ impl ScopeApp {
                         };
                         measurement.elapsed_us = stored_elapsed_us(measurement.elapsed_us, shift_us);
                         newest_elapsed = Some(measurement.elapsed_seconds());
+                        self.live_tail_us = Some(measurement.elapsed_us);
                         let voltage = Metric::Voltage.value(&measurement);
                         let current = Metric::SignedCurrent.value(&measurement);
                         let power = Metric::SignedPower.value(&measurement);
                         let cc1 = Metric::Cc1.value(&measurement);
                         let cc2 = Metric::Cc2.value(&measurement);
-                        self.samples.push_back(measurement);
+                        self.insert_measurement(measurement);
                         if let Some(reading) = self.meter.push(rate, voltage, current, power, cc1, cc2) {
                             self.voltage = Some(reading.voltage);
                             self.current = Some(reading.current);
@@ -422,7 +463,7 @@ impl ScopeApp {
 
     fn observe_pd_events(&mut self, events: &[PdEvent]) {
         let entries = self.pd.observe_events(events);
-        let Some(timeline_anchor) = self.samples.back().map(|sample| sample.elapsed_seconds()) else {
+        let Some(timeline_anchor) = self.capture_time() else {
             return;
         };
         let device_anchor = self
@@ -465,8 +506,8 @@ impl ScopeApp {
                 id,
                 elapsed_seconds,
                 category: spec.category,
-                label: spec.label,
-                name: spec.name,
+                label: spec.label.to_string(),
+                name: spec.name.to_string(),
                 details,
             });
         }
@@ -497,7 +538,7 @@ impl ScopeApp {
         let Some(disconnected_at) = self.disconnected_at.take() else {
             return;
         };
-        let Some(last) = self.samples.back().map(|sample| sample.elapsed_seconds()) else {
+        let Some(last) = self.capture_time() else {
             return;
         };
         let gap_us = wall_gap_us(disconnected_at, Utc::now());
@@ -506,6 +547,349 @@ impl ScopeApp {
         }
         self.dataset_breaks.push(last);
         self.timeline_shift_us = timeline_shift_after_gap(self.timeline_shift_us, gap_us);
+    }
+
+    fn poll_file_ops(&mut self) {
+        while let Ok(message) = self.file_rx.try_recv() {
+            self.file_busy = false;
+            match message {
+                FileMessage::Saved(path) => self.status = format!("Saved {}", path.display()),
+                FileMessage::Failed(error) => self.status = error,
+                FileMessage::Loaded(session) => self.apply_loaded_session(session),
+            }
+        }
+    }
+
+    fn save_session(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("KM003C session", &["kmss"])
+            .set_file_name("session.kmss")
+            .save_file()
+        else {
+            return;
+        };
+        let path = ensure_session_extension(path);
+        let snapshot = self.session_snapshot();
+        self.file_busy = true;
+        self.status = "Saving session...".to_string();
+        let tx = self.file_tx.clone();
+        std::thread::spawn(move || {
+            let message = match session_file::write_session(&path, &snapshot) {
+                Ok(()) => FileMessage::Saved(path),
+                Err(error) => FileMessage::Failed(format!("Save failed: {error}")),
+            };
+            let _ = tx.send(message);
+        });
+    }
+
+    fn load_session(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("KM003C session", &["kmss"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.file_busy = true;
+        self.status = "Loading session...".to_string();
+        let tx = self.file_tx.clone();
+        std::thread::spawn(move || {
+            let message = match session_file::read_session(&path) {
+                Ok(session) => FileMessage::Loaded(session),
+                Err(error) => FileMessage::Failed(format!("Load failed: {error}")),
+            };
+            let _ = tx.send(message);
+        });
+    }
+
+    fn session_snapshot(&self) -> session_file::SessionData {
+        session_file::SessionData {
+            host_origin_utc_us: self.host_time_origin_utc.map(|origin| origin.timestamp_micros()),
+            breaks_us: self.dataset_breaks.iter().copied().map(seconds_to_us).collect(),
+            samples: self.samples.iter().copied().collect(),
+            events: self
+                .markers
+                .iter()
+                .map(|marker| session_file::StoredEvent {
+                    elapsed_us: seconds_to_us(marker.elapsed_seconds),
+                    category: marker.category.as_code(),
+                    label: marker.label.clone(),
+                    name: marker.name.clone(),
+                    details: marker.details.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Append a saved capture onto the same UTC clock as the samples already on screen.
+    ///
+    /// The navigator keeps the real gap between the two origins. While a capture is
+    /// streaming, the load stops at 95% of the buffer so new samples have room.
+    fn apply_loaded_session(&mut self, mut session: session_file::SessionData) {
+        let file_len = session.samples.len();
+        let budget = session_file::load_sample_budget(self.samples.len(), file_len, MAX_SAMPLES, self.streaming);
+        if budget == 0 {
+            self.status = if file_len == 0 {
+                "Session file has no samples".to_string()
+            } else {
+                "Buffer is full; no samples loaded".to_string()
+            };
+            return;
+        }
+        let kept = session.samples.split_off(file_len - budget);
+        let first_us = kept[0].elapsed_us;
+        let last_us = kept[kept.len() - 1].elapsed_us;
+        let events: Vec<_> = session
+            .events
+            .into_iter()
+            .filter(|event| (first_us..=last_us).contains(&event.elapsed_us))
+            .collect();
+        let breaks: Vec<_> = session
+            .breaks_us
+            .into_iter()
+            .filter(|gap| (first_us..last_us).contains(gap))
+            .collect();
+
+        if self.samples.is_empty() {
+            self.install_loaded_session(kept, events, breaks, session.host_origin_utc_us, last_us);
+        } else {
+            self.prepend_loaded_session(kept, events, breaks, first_us, last_us, session.host_origin_utc_us);
+        }
+        self.sort_markers();
+        self.dataset_breaks
+            .sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+        self.dataset_breaks.dedup();
+        self.trim_window();
+        self.status = if budget == file_len {
+            format!("Loaded {budget} samples")
+        } else {
+            format!("Loaded {budget} of {file_len} samples")
+        };
+    }
+
+    fn install_loaded_session(
+        &mut self,
+        samples: Vec<MeasurementSample>,
+        events: Vec<session_file::StoredEvent>,
+        breaks: Vec<u64>,
+        host_origin_utc_us: Option<i64>,
+        last_us: u64,
+    ) {
+        self.samples = samples.into();
+        self.dataset_breaks = breaks.into_iter().map(us_to_seconds).collect();
+        for event in events {
+            let elapsed_us = event.elapsed_us;
+            self.push_stored_event(event, elapsed_us);
+        }
+        self.host_time_origin_utc = host_origin_utc_us.and_then(DateTime::from_timestamp_micros);
+        self.accumulator = MeasurementAccumulator::default();
+        if self.streaming {
+            self.dataset_breaks.push(us_to_seconds(last_us));
+            self.timeline_shift_us = elapsed_shift(last_us.saturating_add(session_file::SESSION_GAP_US));
+            self.accumulator.reset_continuity();
+        } else {
+            self.timeline_shift_us = elapsed_shift(last_us);
+            self.disconnected_at = Some(Utc::now());
+        }
+    }
+
+    fn prepend_loaded_session(
+        &mut self,
+        mut samples: Vec<MeasurementSample>,
+        events: Vec<session_file::StoredEvent>,
+        breaks: Vec<u64>,
+        first_us: u64,
+        last_us: u64,
+        host_origin_utc_us: Option<i64>,
+    ) {
+        if let (Some(current_origin), Some(file_origin)) = (
+            self.host_time_origin_utc.map(|origin| origin.timestamp_micros()),
+            host_origin_utc_us,
+        ) {
+            self.merge_loaded_on_clock(samples, events, breaks, current_origin, file_origin);
+            return;
+        }
+        let current_first = self.samples.front().map(|sample| sample.elapsed_us).unwrap_or(0);
+        let place = session_file::place_loaded_before(current_first, first_us, last_us, session_file::SESSION_GAP_US);
+        if place.current_pad_us > 0 {
+            let pad_seconds = us_to_seconds(place.current_pad_us);
+            for sample in &mut self.samples {
+                sample.elapsed_us = sample.elapsed_us.saturating_add(place.current_pad_us);
+            }
+            for marker in &mut self.markers {
+                marker.elapsed_seconds += pad_seconds;
+            }
+            for gap in &mut self.dataset_breaks {
+                *gap += pad_seconds;
+            }
+            if let Some(end) = &mut self.view_end {
+                *end += pad_seconds;
+            }
+            if let Some(cursor) = &mut self.cursor_time {
+                *cursor += pad_seconds;
+            }
+            self.timeline_shift_us = self.timeline_shift_us.saturating_add_unsigned(place.current_pad_us);
+            if let Some(origin) = &mut self.host_time_origin_utc {
+                *origin -= TimeDelta::microseconds(place.current_pad_us as i64);
+            }
+        }
+        for sample in &mut samples {
+            sample.elapsed_us = session_file::map_loaded_elapsed(sample.elapsed_us, first_us, place.loaded_base_us);
+        }
+        let loaded_last = session_file::map_loaded_elapsed(last_us, first_us, place.loaded_base_us);
+        self.dataset_breaks.push(us_to_seconds(loaded_last));
+        self.dataset_breaks.extend(
+            breaks
+                .into_iter()
+                .map(|gap| us_to_seconds(session_file::map_loaded_elapsed(gap, first_us, place.loaded_base_us))),
+        );
+        for event in events {
+            let elapsed_us = session_file::map_loaded_elapsed(event.elapsed_us, first_us, place.loaded_base_us);
+            self.push_stored_event(event, elapsed_us);
+        }
+        let mut combined = VecDeque::from(samples);
+        combined.append(&mut self.samples);
+        self.samples = combined;
+    }
+
+    /// Place both captures on one clock, using each session's host-time origin.
+    fn merge_loaded_on_clock(
+        &mut self,
+        mut samples: Vec<MeasurementSample>,
+        events: Vec<session_file::StoredEvent>,
+        breaks: Vec<u64>,
+        current_origin_us: i64,
+        file_origin_us: i64,
+    ) {
+        let mut earliest = i128::MAX;
+        let mut note = |origin: i64, elapsed_us: u64| {
+            earliest = earliest.min(session_file::absolute_us(origin, elapsed_us));
+        };
+        for sample in &self.samples {
+            note(current_origin_us, sample.elapsed_us);
+        }
+        for sample in &samples {
+            note(file_origin_us, sample.elapsed_us);
+        }
+        for marker in &self.markers {
+            note(current_origin_us, seconds_to_us(marker.elapsed_seconds));
+        }
+        for event in &events {
+            note(file_origin_us, event.elapsed_us);
+        }
+        for gap in &self.dataset_breaks {
+            note(current_origin_us, seconds_to_us(*gap));
+        }
+        for gap in &breaks {
+            note(file_origin_us, *gap);
+        }
+        let rebase = |origin: i64, elapsed_us: u64| {
+            session_file::elapsed_on_origin(session_file::absolute_us(origin, elapsed_us), earliest)
+        };
+        let loaded_span = (
+            samples.first().map(|sample| rebase(file_origin_us, sample.elapsed_us)),
+            samples.last().map(|sample| rebase(file_origin_us, sample.elapsed_us)),
+        );
+        let current_span = (
+            self.samples
+                .front()
+                .map(|sample| rebase(current_origin_us, sample.elapsed_us)),
+            self.samples
+                .back()
+                .map(|sample| rebase(current_origin_us, sample.elapsed_us)),
+        );
+
+        for sample in &mut self.samples {
+            sample.elapsed_us = rebase(current_origin_us, sample.elapsed_us);
+        }
+        for sample in &mut samples {
+            sample.elapsed_us = rebase(file_origin_us, sample.elapsed_us);
+        }
+        for marker in &mut self.markers {
+            marker.elapsed_seconds = us_to_seconds(rebase(current_origin_us, seconds_to_us(marker.elapsed_seconds)));
+        }
+        for gap in &mut self.dataset_breaks {
+            *gap = us_to_seconds(rebase(current_origin_us, seconds_to_us(*gap)));
+        }
+        if let Some(end) = &mut self.view_end {
+            *end = us_to_seconds(rebase(current_origin_us, seconds_to_us(*end)));
+        }
+        if let Some(cursor) = &mut self.cursor_time {
+            *cursor = us_to_seconds(rebase(current_origin_us, seconds_to_us(*cursor)));
+        }
+        if let Some(tail) = self.live_tail_us {
+            self.live_tail_us = Some(rebase(current_origin_us, tail));
+        }
+        self.timeline_shift_us = add_shift(self.timeline_shift_us, i128::from(current_origin_us) - earliest);
+        self.dataset_breaks
+            .extend(breaks.into_iter().map(|gap| us_to_seconds(rebase(file_origin_us, gap))));
+        if let (Some(loaded_last), Some(current_first)) = (loaded_span.1, current_span.0)
+            && loaded_last < current_first
+        {
+            self.dataset_breaks.push(us_to_seconds(loaded_last));
+        }
+        if let (Some(current_last), Some(loaded_first)) = (current_span.1, loaded_span.0)
+            && current_last < loaded_first
+        {
+            self.dataset_breaks.push(us_to_seconds(current_last));
+        }
+        for event in events {
+            let elapsed_us = rebase(file_origin_us, event.elapsed_us);
+            self.push_stored_event(event, elapsed_us);
+        }
+        let mut combined = samples;
+        combined.extend(self.samples.drain(..));
+        combined.sort_by_key(|sample| sample.elapsed_us);
+        self.samples = combined.into();
+        if let Ok(micros) = i64::try_from(earliest) {
+            self.host_time_origin_utc = DateTime::from_timestamp_micros(micros);
+        }
+    }
+
+    fn insert_measurement(&mut self, sample: MeasurementSample) {
+        self.live_tail_us = Some(sample.elapsed_us);
+        let index = self
+            .samples
+            .partition_point(|existing| existing.elapsed_us < sample.elapsed_us);
+        self.samples.insert(index, sample);
+    }
+
+    fn capture_time(&self) -> Option<f64> {
+        self.live_tail_us
+            .map(us_to_seconds)
+            .or_else(|| self.samples.back().map(|sample| sample.elapsed_seconds()))
+    }
+
+    fn autoscroll_end(&self) -> Option<f64> {
+        if self.streaming
+            && let Some(tail) = self.live_tail_us
+        {
+            return Some(us_to_seconds(tail));
+        }
+        self.samples.back().map(|sample| sample.elapsed_seconds())
+    }
+
+    fn push_stored_event(&mut self, event: session_file::StoredEvent, elapsed_us: u64) {
+        let id = self.next_marker_id;
+        self.next_marker_id = self.next_marker_id.wrapping_add(1);
+        self.markers.push_back(TimelineMarker {
+            id,
+            elapsed_seconds: us_to_seconds(elapsed_us),
+            category: TimelineCategory::from_code(event.category),
+            label: event.label,
+            name: event.name,
+            details: event.details,
+        });
+    }
+
+    fn sort_markers(&mut self) {
+        let mut markers: Vec<_> = self.markers.drain(..).collect();
+        markers.sort_by(|left, right| {
+            left.elapsed_seconds
+                .partial_cmp(&right.elapsed_seconds)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        self.markers.extend(markers);
     }
 
     fn trim_window(&mut self) {
@@ -568,6 +952,27 @@ impl ScopeApp {
             self.status = "Connecting...".to_string();
             let _ = self.session.connect(self.rate, self.usb_reset);
         }
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.samples.is_empty() && !self.file_busy,
+                    egui::Button::new("Save session"),
+                )
+                .on_hover_text("Write the waveforms and events to a session file")
+                .clicked()
+            {
+                self.save_session();
+            }
+            if ui
+                .add_enabled(!self.file_busy, egui::Button::new("Load session"))
+                .on_hover_text("Append a saved session on its real clock. A live capture keeps 5% of the buffer free.")
+                .clicked()
+            {
+                self.load_session();
+            }
+        });
 
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -692,7 +1097,7 @@ impl ScopeApp {
                     }
                     if selected {
                         response.on_hover_ui(|ui| {
-                            ui.strong(marker.name);
+                            ui.strong(marker.name.as_str());
                             ui.monospace(format_event_full_time(host_time_origin_utc, marker.elapsed_seconds));
                             ui.monospace(format!("Elapsed: {:.3} s", marker.elapsed_seconds));
                             ui.separator();
@@ -1056,9 +1461,9 @@ impl ScopeApp {
         if self.autoscroll
             && !panning
             && !dragging_overview
-            && let Some(latest) = self.samples.back()
+            && let Some(latest) = self.autoscroll_end()
         {
-            self.view_end = Some(latest.elapsed_seconds());
+            self.view_end = Some(latest);
         }
         if dragging_overview {
             self.autoscroll = false;
@@ -1523,7 +1928,7 @@ fn trace_plot(
 
 fn paint_timeline_markers(ui: &egui::Ui, lane: MarkerLane<'_>, transform: &egui_plot::PlotTransform) {
     let frame = *transform.frame();
-    let mut clusters: Vec<(f32, TimelineCategory, &'static str, usize, bool)> = Vec::new();
+    let mut clusters: Vec<(f32, TimelineCategory, &str, usize, bool)> = Vec::new();
     for marker in lane.markers {
         let x = transform.position_from_point_x(marker.elapsed_seconds);
         if x < frame.left() || x > frame.right() {
@@ -1539,7 +1944,13 @@ fn paint_timeline_markers(ui: &egui::Ui, lane: MarkerLane<'_>, transform: &egui_
             }
             continue;
         }
-        clusters.push((x, marker.category, marker.label, 1, lane.selected_id == Some(marker.id)));
+        clusters.push((
+            x,
+            marker.category,
+            marker.label.as_str(),
+            1,
+            lane.selected_id == Some(marker.id),
+        ));
     }
 
     let painter = ui.ctx().layer_painter(ui.layer_id()).with_clip_rect(lane.rect);
@@ -2400,12 +2811,45 @@ fn cursor_label_on_left(cursor: f64, view_end: f64, pixels_per_second: f64) -> b
 }
 
 /// Elapsed microseconds stored on a sample. `shift_us` is the reconnect gap accumulated so far.
-fn stored_elapsed_us(raw_elapsed_us: u64, shift_us: u64) -> u64 {
-    raw_elapsed_us.saturating_add(shift_us)
+fn stored_elapsed_us(raw_elapsed_us: u64, shift_us: i64) -> u64 {
+    let value = i128::from(raw_elapsed_us) + i128::from(shift_us);
+    if value <= 0 {
+        0
+    } else {
+        u64::try_from(value).unwrap_or(u64::MAX)
+    }
 }
 
-fn timeline_shift_after_gap(shift_us: u64, gap_us: u64) -> u64 {
-    shift_us.saturating_add(gap_us)
+fn timeline_shift_after_gap(shift_us: i64, gap_us: u64) -> i64 {
+    shift_us.saturating_add_unsigned(gap_us)
+}
+
+fn elapsed_shift(elapsed_us: u64) -> i64 {
+    i64::try_from(elapsed_us).unwrap_or(i64::MAX)
+}
+
+fn add_shift(shift_us: i64, delta_us: i128) -> i64 {
+    let value = i128::from(shift_us) + delta_us;
+    i64::try_from(value).unwrap_or(if value > 0 { i64::MAX } else { i64::MIN })
+}
+
+fn us_to_seconds(us: u64) -> f64 {
+    us as f64 / 1_000_000.0
+}
+
+fn seconds_to_us(seconds: f64) -> u64 {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        0
+    } else {
+        (seconds * 1_000_000.0).round() as u64
+    }
+}
+
+fn ensure_session_extension(mut path: std::path::PathBuf) -> std::path::PathBuf {
+    if path.extension().is_none() {
+        path.set_extension("kmss");
+    }
+    path
 }
 
 fn wall_gap_us(disconnected_at: DateTime<Utc>, resumed_at: DateTime<Utc>) -> u64 {
