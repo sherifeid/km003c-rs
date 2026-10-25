@@ -687,6 +687,8 @@ impl ScopeApp {
         } else {
             self.prepend_loaded_session(kept, events, breaks, first_us, last_us, session.host_origin_utc_us);
         }
+        self.dataset_breaks
+            .extend(large_gap_breaks(&self.samples, OVERVIEW_LARGE_GAP_SECS));
         self.sort_markers();
         self.dataset_breaks
             .sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
@@ -1372,6 +1374,7 @@ impl ScopeApp {
         ui.spacing_mut().item_spacing.y = STRIP_GAP_BETWEEN;
         let link = ui.id().with("scope_time");
         let time = visible_time(self.view_end, self.window_secs);
+        let plot_breaks = with_large_gaps(&self.samples, &self.dataset_breaks);
         let visible_samples = self
             .view_end
             .map(|end| visible_sample_range(&self.samples, end - self.window_secs, end));
@@ -1388,7 +1391,7 @@ impl ScopeApp {
                 None => Vec::new(),
             };
             ui.allocate_ui(egui::vec2(width, STRIP_HEIGHT), |ui| {
-                let cursor = self.cursor_mark(strip.metric);
+                let cursor = self.cursor_mark(strip.metric, &plot_breaks);
                 let marker_lane = (strip.metric == Metric::Voltage).then_some(MarkerLane {
                     markers: &self.markers,
                     rect: event_lane_rect,
@@ -1400,7 +1403,7 @@ impl ScopeApp {
                     &points,
                     link,
                     time.clone(),
-                    &self.dataset_breaks,
+                    &plot_breaks,
                     TraceOverlay {
                         marker_lane,
                         cursor,
@@ -1568,7 +1571,7 @@ impl ScopeApp {
         self.view_end = Some(clamped_view_end(end, buf_start, buf_end, self.window_secs));
     }
 
-    fn cursor_mark(&self, metric: Metric) -> Option<CursorMark> {
+    fn cursor_mark(&self, metric: Metric, breaks: &[f64]) -> Option<CursorMark> {
         if !self.cursor_mode {
             return None;
         }
@@ -1578,7 +1581,7 @@ impl ScopeApp {
             .is_some_and(|end| cursor_label_on_left(time, end, self.pixels_per_second));
         Some(CursorMark {
             time,
-            value: cursor_value(&self.samples, metric, time, &self.dataset_breaks),
+            value: cursor_value(&self.samples, metric, time, breaks),
             label_on_left,
         })
     }
@@ -1629,13 +1632,14 @@ impl ScopeApp {
         let Some(map) = overview_map(&self.samples, &self.dataset_breaks, frame.width()) else {
             return;
         };
+        let breaks = with_large_gaps(&self.samples, &self.dataset_breaks);
         let columns = (frame.width() as usize).clamp(1, 1200);
         for (metric, color) in [
             (Metric::SignedPower, POWER_COLOR),
             (Metric::SignedCurrent, CURRENT_COLOR),
             (Metric::Voltage, VOLTAGE_COLOR),
         ] {
-            let points = overview_segments(&self.samples, metric, columns, &self.dataset_breaks);
+            let points = overview_segments(&self.samples, metric, columns, &breaks);
             paint_overview_segments(&painter, frame, &points, &map, color);
         }
         let view_end = self.view_end.unwrap_or(map.end);
@@ -2715,8 +2719,30 @@ impl OverviewMap {
     }
 }
 
+fn large_gap_breaks(samples: &VecDeque<MeasurementSample>, min_gap: f64) -> Vec<f64> {
+    let mut breaks = Vec::new();
+    for index in 1..samples.len() {
+        let previous = samples[index - 1].elapsed_seconds();
+        let time = samples[index].elapsed_seconds();
+        if time - previous >= min_gap {
+            breaks.push(previous);
+        }
+    }
+    breaks
+}
+
+/// Stored breaks plus every large jump, so each loaded session gets its own mark.
+fn with_large_gaps(samples: &VecDeque<MeasurementSample>, breaks: &[f64]) -> Vec<f64> {
+    let mut combined = breaks.to_vec();
+    combined.extend(large_gap_breaks(samples, OVERVIEW_LARGE_GAP_SECS));
+    combined.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    combined.dedup();
+    combined
+}
+
 fn overview_map(samples: &VecDeque<MeasurementSample>, breaks: &[f64], width_px: f32) -> Option<OverviewMap> {
-    let ranges = dataset_ranges(samples, breaks);
+    let breaks = with_large_gaps(samples, breaks);
+    let ranges = dataset_ranges(samples, &breaks);
     let mut segments = Vec::new();
     for range in ranges {
         if range.is_empty() {
@@ -3241,17 +3267,17 @@ mod tests {
     use super::{
         AXIS_THICKNESS, CENTRAL_PANEL_MARGIN, EVENT_LANE_GAP, EVENT_LANE_HEIGHT, EVENT_TOOLBAR_HEIGHT, GraphSampleRate,
         MAX_PIXELS_PER_SECOND, MAX_SAMPLES, MIN_PIXELS_PER_SECOND, MIN_VOLTAGE_SPAN, MIN_Y_SPAN, MeterAverage,
-        OVERVIEW_HEIGHT, PIXELS_PER_SECOND, STRIP_GAP_BETWEEN, STRIP_HEIGHT, TimelineCategory, TimelineMarkerSpec,
-        Y_MARGIN_FRACTION, axis_fraction_digits, buffer_fraction, buffer_meter_label, centered_view_end,
-        clamped_cursor, clamped_view_end, clock_grid_steps, crosses_dataset_break, cursor_label_on_left, cursor_value,
-        explorer_viewport_size, fitted_cursor_font_size, format_axis_time, format_engineering_tick, format_event_time,
-        format_max_power, format_measurement, format_temperature, host_time_grid_marks, host_time_utc, identity_label,
-        initial_window_size, layer_covers_plots, meter_pane_width, minimum_pixels_for_span, minimum_window_size,
-        overview_centered_view_end, overview_dragged_view_end, overview_map_from_segments, panned_view_end,
-        pd_timeline_marker, pd_timeline_time, pointer_blocks_plots, protocol_label, samples_per_meter_update,
-        scaled_y_range, series, split_series, stored_elapsed_us, time_at_pointer, timeline_origin_utc,
-        timeline_shift_after_gap, trim_to_max_samples, usb_vendor_name, visible_sample_range, wall_gap_us,
-        zoomed_pixels_per_second, zoomed_view_end_at_pointer,
+        OVERVIEW_HEIGHT, OVERVIEW_LARGE_GAP_SECS, PIXELS_PER_SECOND, STRIP_GAP_BETWEEN, STRIP_HEIGHT, TimelineCategory,
+        TimelineMarkerSpec, Y_MARGIN_FRACTION, axis_fraction_digits, buffer_fraction, buffer_meter_label,
+        centered_view_end, clamped_cursor, clamped_view_end, clock_grid_steps, crosses_dataset_break,
+        cursor_label_on_left, cursor_value, dataset_ranges, explorer_viewport_size, fitted_cursor_font_size,
+        format_axis_time, format_engineering_tick, format_event_time, format_max_power, format_measurement,
+        format_temperature, host_time_grid_marks, host_time_utc, identity_label, initial_window_size, large_gap_breaks,
+        layer_covers_plots, meter_pane_width, minimum_pixels_for_span, minimum_window_size, overview_centered_view_end,
+        overview_dragged_view_end, overview_map_from_segments, panned_view_end, pd_timeline_marker, pd_timeline_time,
+        pointer_blocks_plots, protocol_label, samples_per_meter_update, scaled_y_range, series, split_series,
+        stored_elapsed_us, time_at_pointer, timeline_origin_utc, timeline_shift_after_gap, trim_to_max_samples,
+        usb_vendor_name, visible_sample_range, wall_gap_us, zoomed_pixels_per_second, zoomed_view_end_at_pointer,
     };
     use km003c_lib::MeasurementSample;
     use km003c_lib::Metric;
@@ -3642,10 +3668,23 @@ mod tests {
         let map = overview_map_from_segments(&[(0.0, 100.0)], 100.0).unwrap();
         assert!((overview_dragged_view_end(50.0, 10.0, 100.0, &map, 10.0) - 60.0).abs() < 1e-6);
         assert!((overview_dragged_view_end(98.0, 10.0, 100.0, &map, 10.0) - 100.0).abs() < 1e-6);
-        let gapped = overview_map_from_segments(&[(0.0, 10.0), (3_610.0, 3_620.0)], 100.0).unwrap();
-        let gap = gapped.time_to_fraction(3_610.0) - gapped.time_to_fraction(10.0);
-        assert!((gap - 0.08).abs() < 0.02, "{gap}");
-        assert!(gapped.time_to_fraction(10.0) > 0.4);
+        let gapped =
+            overview_map_from_segments(&[(0.0, 10.0), (3_610.0, 3_620.0), (10_000.0, 10_010.0)], 200.0).unwrap();
+        let first_gap = gapped.time_to_fraction(3_610.0) - gapped.time_to_fraction(10.0);
+        let second_gap = gapped.time_to_fraction(10_000.0) - gapped.time_to_fraction(3_620.0);
+        assert!(first_gap < 0.1, "{first_gap}");
+        assert!(second_gap < 0.1, "{second_gap}");
+        assert!(gapped.time_to_fraction(10.0) > 0.2);
+        let samples = VecDeque::from([
+            voltage_sample(0, 1.0),
+            voltage_sample(10_000_000, 1.0),
+            voltage_sample(3_610_000_000, 1.0),
+            voltage_sample(3_620_000_000, 1.0),
+            voltage_sample(10_000_000_000, 1.0),
+        ]);
+        let found = large_gap_breaks(&samples, OVERVIEW_LARGE_GAP_SECS);
+        assert_eq!(found.len(), 2);
+        assert_eq!(dataset_ranges(&samples, &found).len(), 3);
         assert!((overview_centered_view_end(80.0, 0.0, 100.0, 10.0) - 85.0).abs() < 1e-9);
         assert!((overview_centered_view_end(2.0, 0.0, 100.0, 10.0) - 10.0).abs() < 1e-9);
         assert!((overview_centered_view_end(98.0, 0.0, 100.0, 10.0) - 100.0).abs() < 1e-9);
