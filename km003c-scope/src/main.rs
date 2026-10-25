@@ -76,9 +76,9 @@ const MIN_SECONDS: f64 = 4.0;
 const STRIP_HEIGHT: f32 = 200.0;
 /// Full-buffer preview above the event lane, one sixth of a measurement strip.
 const OVERVIEW_HEIGHT: f32 = STRIP_HEIGHT / 6.0;
-/// A disconnect longer than this is a fixed mark in the navigator, not a to-scale gap.
+/// A jump this long is a capture boundary even when no break was stored.
 const OVERVIEW_LARGE_GAP_SECS: f64 = 60.0;
-/// Width of that mark. The timestamps still hold the real duration.
+/// Width of a gap mark. Every break between captures uses this, not the real duration.
 const OVERVIEW_GAP_MARK_PX: f32 = 8.0;
 const OVERVIEW_GAP_COLOR: Color32 = Color32::from_rgb(220, 64, 64);
 /// Vertical padding around an autoscaled trace, as a fraction of its span.
@@ -2771,12 +2771,10 @@ fn overview_map_from_segments(segments: &[(f64, f64)], width_px: f32) -> Option<
             let previous_end = segments[index - 1].1;
             let gap = *start - previous_end;
             if gap > 0.0 {
-                let before = (segments[index - 1].1 - segments[index - 1].0).max(0.0);
-                let after = (*end - *start).max(0.0);
                 raw.push(RawPiece {
                     start: previous_end,
                     end: *start,
-                    collapsed: gap >= OVERVIEW_LARGE_GAP_SECS || gap > (before + after).max(1.0),
+                    collapsed: true,
                     duration: gap,
                 });
             }
@@ -3675,6 +3673,9 @@ mod tests {
         assert!(first_gap < 0.1, "{first_gap}");
         assert!(second_gap < 0.1, "{second_gap}");
         assert!(gapped.time_to_fraction(10.0) > 0.2);
+        let reconnect = overview_map_from_segments(&[(0.0, 30.0), (35.0, 65.0)], 100.0).unwrap();
+        let short_gap = reconnect.time_to_fraction(35.0) - reconnect.time_to_fraction(30.0);
+        assert!((short_gap - 0.08).abs() < 0.02, "{short_gap}");
         let samples = VecDeque::from([
             voltage_sample(0, 1.0),
             voltage_sample(10_000_000, 1.0),
