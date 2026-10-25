@@ -2027,6 +2027,11 @@ impl ScopeApp {
                 egui::Stroke::new(2.0, OVERVIEW_GAP_COLOR),
             );
         }
+        if self.cursor_mode
+            && let Some(time) = self.cursor_time
+        {
+            paint_overview_cursor(&painter, frame, &map, time);
+        }
     }
 }
 
@@ -2431,11 +2436,7 @@ fn paint_cursor_value(ui: &egui::Ui, strip: &Strip, cursor: &CursorMark, transfo
         return;
     };
     let frame = *transform.frame();
-    let room = if strip.metric == Metric::Voltage {
-        f32::INFINITY
-    } else {
-        (STRIP_GAP_BETWEEN - 2.0).max(1.0)
-    };
+    let room = (STRIP_GAP_BETWEEN - 2.0).max(1.0);
     let text = format!("{value:.3} {}", strip.unit);
     let galley = ui.painter().layout_no_wrap(
         text.clone(),
@@ -2460,12 +2461,8 @@ fn paint_cursor_value(ui: &egui::Ui, strip: &Strip, cursor: &CursorMark, transfo
     };
     let min_x = frame.left();
     let max_x = (frame.right() - galley.size().x).max(min_x);
-    let text_y = if strip.metric == Metric::Voltage {
-        frame.top() + 4.0
-    } else {
-        let gap = STRIP_GAP_BETWEEN;
-        (frame.top() - gap + (gap - galley.size().y) * 0.5).min(frame.top() - galley.size().y)
-    };
+    let gap = STRIP_GAP_BETWEEN;
+    let text_y = (frame.top() - gap + (gap - galley.size().y) * 0.5).min(frame.top() - galley.size().y);
     ui.ctx()
         .layer_painter(ui.layer_id())
         .galley(egui::pos2(text_x.clamp(min_x, max_x), text_y), galley, strip.color);
@@ -3268,6 +3265,27 @@ fn overview_segments(
         .collect()
 }
 
+/// A white caret and line on the full-buffer navigator. No numbers.
+fn paint_overview_cursor(painter: &egui::Painter, frame: egui::Rect, map: &OverviewMap, time: f64) {
+    let x = frame.left() + map.time_to_fraction(time).clamp(0.0, 1.0) as f32 * frame.width();
+    let color = Color32::WHITE;
+    painter.line_segment(
+        [egui::pos2(x, frame.top()), egui::pos2(x, frame.bottom())],
+        egui::Stroke::new(1.5, color),
+    );
+    let half = 4.0;
+    let height = 6.0;
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(x - half, frame.top()),
+            egui::pos2(x + half, frame.top()),
+            egui::pos2(x, frame.top() + height),
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
+}
+
 fn paint_overview_segments(
     painter: &egui::Painter,
     frame: egui::Rect,
@@ -3587,9 +3605,8 @@ fn window_size(seconds: f64) -> [f32; 2] {
         + OVERVIEW_HEIGHT
         + EVENT_LANE_GAP
         + EVENT_LANE_HEIGHT
-        + EVENT_LANE_GAP
+        + STRIP_GAP_BETWEEN * 3.0
         + STRIP_HEIGHT * 3.0
-        + STRIP_GAP_BETWEEN * 2.0
         + CENTRAL_PANEL_MARGIN * 2.0;
     [width, height]
 }
@@ -3674,6 +3691,15 @@ mod tests {
     use km003c_lib::PdLogEntry;
     use km003c_lib::PdRevision;
     use std::collections::VecDeque;
+
+    #[test]
+    fn navigator_keeps_a_cursor_that_is_outside_the_visible_window() {
+        let map = overview_map_from_segments(&[(0.0, 100.0)], 100.0).unwrap();
+        let cursor = map.time_to_fraction(10.0);
+        let window_left = map.time_to_fraction(92.0);
+        assert!(cursor < window_left);
+        assert!((0.0..=1.0).contains(&cursor));
+    }
 
     #[test]
     fn meter_decimals_share_one_column() {
@@ -3850,9 +3876,8 @@ mod tests {
                 + OVERVIEW_HEIGHT
                 + EVENT_LANE_GAP
                 + EVENT_LANE_HEIGHT
-                + EVENT_LANE_GAP
+                + STRIP_GAP_BETWEEN * 3.0
                 + STRIP_HEIGHT * 3.0
-                + STRIP_GAP_BETWEEN * 2.0
                 + CENTRAL_PANEL_MARGIN * 2.0
         );
 
