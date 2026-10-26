@@ -568,14 +568,13 @@ async fn stream(
             }
         }
 
-        // Poll often enough that the device queue never overflows.
-        let delay_ms = match current_rate {
-            GraphSampleRate::Sps2 => 200,  // 5 requests/sec for 2 SPS
-            GraphSampleRate::Sps10 => 50,  // 20 requests/sec for 10 SPS
-            GraphSampleRate::Sps50 => 20,  // 50 requests/sec for 50 SPS
-            GraphSampleRate::Sps1000 => 5, // 200 requests/sec for 1000 SPS
-        };
-        crate::runtime::sleep(Duration::from_millis(delay_ms)).await;
+        // While a browser tab is hidden, setTimeout is clamped to about a
+        // second. Sleeping here would let the device queue overflow, and the
+        // plot would connect the surviving samples with a straight line.
+        // The USB read above already yields, so skip the pause.
+        if let Some(delay) = poll_delay(current_rate, crate::runtime::browser_timers_throttled()) {
+            crate::runtime::sleep(delay).await;
+        }
     }
 
     info!("Stopping streaming");
@@ -587,6 +586,20 @@ async fn stream(
     if !reconnect_when_present && let Some(error) = terminal_error {
         let _ = tx.send(SessionEvent::Error(error));
     }
+}
+
+/// Pause between graph polls, or `None` when a timer pause would be clamped.
+fn poll_delay(rate: GraphSampleRate, timers_throttled: bool) -> Option<Duration> {
+    if timers_throttled {
+        return None;
+    }
+    // Often enough that the device queue does not overflow.
+    Some(Duration::from_millis(match rate {
+        GraphSampleRate::Sps2 => 200,  // 5 requests/sec for 2 SPS
+        GraphSampleRate::Sps10 => 50,  // 20 requests/sec for 10 SPS
+        GraphSampleRate::Sps50 => 20,  // 50 requests/sec for 50 SPS
+        GraphSampleRate::Sps1000 => 5, // 200 requests/sec for 1000 SPS
+    }))
 }
 
 fn streaming_attribute_mask(pd_trace_enabled: bool, adc_telemetry: bool) -> AttributeSet {
@@ -625,6 +638,28 @@ async fn restart_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_tabs_do_not_sleep_between_graph_polls() {
+        assert_eq!(poll_delay(GraphSampleRate::Sps1000, true), None);
+        assert_eq!(poll_delay(GraphSampleRate::Sps2, true), None);
+        assert_eq!(
+            poll_delay(GraphSampleRate::Sps1000, false),
+            Some(Duration::from_millis(5))
+        );
+        assert_eq!(
+            poll_delay(GraphSampleRate::Sps50, false),
+            Some(Duration::from_millis(20))
+        );
+        assert_eq!(
+            poll_delay(GraphSampleRate::Sps10, false),
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(
+            poll_delay(GraphSampleRate::Sps2, false),
+            Some(Duration::from_millis(200))
+        );
+    }
 
     #[test]
     fn optional_streaming_attributes_are_only_requested_when_due() {
