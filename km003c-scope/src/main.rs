@@ -412,6 +412,7 @@ impl eframe::App for ScopeApp {
 
 #[cfg(target_arch = "wasm32")]
 fn web_console(ui: &mut egui::Ui) {
+    let console_rect = ui.max_rect();
     let font = egui::FontId::new(13.0, egui::FontFamily::Name("Space Mono".into()));
     ui.spacing_mut().item_spacing.y = 1.0;
     let lines = console_log::snapshot();
@@ -448,6 +449,46 @@ fn web_console(ui: &mut egui::Ui) {
                 );
             }
         });
+    copy_console_button(ui, console_rect);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn copy_console_button(ui: &mut egui::Ui, console_rect: egui::Rect) {
+    let copied_id = ui.id().with("console_copied_at");
+    let now = ui.input(|input| input.time);
+    let recently_copied = ui.data(|data| {
+        data.get_temp::<f64>(copied_id)
+            .is_some_and(|copied_at| now - copied_at < 1.2)
+    });
+    let label = if recently_copied { "Copied" } else { "Copy" };
+    let width = if recently_copied { 68.0 } else { 52.0 };
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(console_rect.right() - width - 10.0, console_rect.top()),
+        egui::vec2(width, 22.0),
+    );
+    let color = if recently_copied {
+        Color32::from_rgb(50, 190, 80)
+    } else {
+        console_log::DIM
+    };
+    let response = ui.put(
+        rect,
+        egui::Button::new(
+            egui::RichText::new(label)
+                .font(egui::FontId::new(12.0, egui::FontFamily::Name("Space Mono".into())))
+                .color(color),
+        )
+        .small()
+        .fill(Color32::from_rgba_premultiplied(12, 12, 12, 220))
+        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(64, 64, 64)))
+        .corner_radius(4),
+    );
+    if response.clicked() {
+        ui.ctx().copy_text(console_log::plain_text());
+        ui.data_mut(|data| data.insert_temp(copied_id, now));
+        ui.ctx().request_repaint_after(Duration::from_millis(1300));
+    }
+    response.on_hover_text("Copy the console");
 }
 
 /// A native info window uses the operating system's close button.

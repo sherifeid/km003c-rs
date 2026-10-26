@@ -16,6 +16,7 @@ use futures_util::StreamExt;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+use uom::si::thermodynamic_temperature::degree_celsius;
 
 use crate::adc::AdcDataSimple;
 use crate::device::{PID, VID};
@@ -514,6 +515,10 @@ async fn stream(
                 error_count = 0;
 
                 if let Some(adc) = packet.get_adc() {
+                    let temperature_c = adc.temperature.get::<degree_celsius>();
+                    if temperature_poll_is_empty(temperature_c) {
+                        warn!(temperature_c, "Temperature poll was empty");
+                    }
                     let _ = tx.send(SessionEvent::AdcUpdate(*adc));
                 }
 
@@ -588,6 +593,11 @@ async fn stream(
     }
 }
 
+/// The temperature register is i16::MIN, -256°C, when the meter has no conversion.
+fn temperature_poll_is_empty(celsius: f64) -> bool {
+    !celsius.is_finite() || celsius <= -256.0
+}
+
 /// Pause between graph polls, or `None` when a timer pause would be clamped.
 fn poll_delay(rate: GraphSampleRate, timers_throttled: bool) -> Option<Duration> {
     if timers_throttled {
@@ -638,6 +648,14 @@ async fn restart_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_temperature_register_is_not_a_reading() {
+        assert!(temperature_poll_is_empty(-256.0));
+        assert!(temperature_poll_is_empty(f64::NAN));
+        assert!(!temperature_poll_is_empty(31.2));
+        assert!(!temperature_poll_is_empty(-255.99));
+    }
 
     #[test]
     fn background_tabs_do_not_sleep_between_graph_polls() {
