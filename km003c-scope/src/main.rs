@@ -2299,6 +2299,7 @@ fn current_flows_up(current: Option<f64>) -> Option<bool> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_meter_footer(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -2488,6 +2489,7 @@ impl MeterAverage {
     }
 
     /// Average the next half-second of samples. Returns the mean once the window is full.
+    #[allow(clippy::too_many_arguments)]
     fn push(
         &mut self,
         rate: GraphSampleRate,
