@@ -1,0 +1,19 @@
+[package]
+name = "km003c-firmware-manual"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+km003c-lib.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+nusb = "0.2.7"
+aes = "0.9.1"
+crc32fast = "1.5.0"
+clap = { version = "4.6.2", features = ["derive"] }
+indicatif = "0.18"
+rand = "0.10.2"

@@ -54,10 +54,10 @@ terminator, including a zero-length packet when needed.
 
 ## Validation
 
-`firmware-update --verify-only` successfully parsed and CRC-checked the
+`km003c-firmware-manual --verify-only` successfully parsed and CRC-checked the
 official KM003C V2.0.7 package (SHA-256
 `7a081af887fa8873d9e0cfc9cee9654187ab392f882efed16c1904a184ce8454`).
-`firmware-update --check` also detected a connected KM003C in application
+`km003c-firmware-manual --check` also detected a connected KM003C in application
 mode, confirmed its model, and read its current firmware version. `cargo check`
 covers the library and CLI. The USB write sequence is based on static analysis
 and has not yet been exercised on a physical device.

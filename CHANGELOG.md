@@ -9,9 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `KM003C::set_graph_sample_rate()` switches an active ADC queue stream to a
-  new rate by stopping and restarting graph mode, and
-  `KM003C::graph_sample_rate()` reports the selected rate.
+- An official-first firmware client shared by CLI, desktop and browser GUI,
+  with archive fallback after HTTP, catalog or package validation errors.
+  Fallback matches version, build date, size and CRC; callers can inspect the
+  actual source and failure reason. Browser requests use OSS V1 signed URLs.
+- Named encrypted-value records and standard CBC decoding for embedded keys,
+  preserving their values and lazy initialization. The Nix shell automatically
+  selects a CA bundle for Python/OpenSSL without disabling TLS verification.
+
+- An egui Firmware tab for catalog/local packages, upgrades, downgrades and
+  reinstalls, with device checks, confirmation, verified backup storage and
+  library progress. Browser backups await a File System Access write and close.
+- `Session::disconnect_and_wait()` releases the measurement USB handle before
+  another operation takes ownership.
+- A pinned Nix development shell with desktop GUI runtime libraries and paths.
+
+- `InstalledFirmwareInfo::validate_application()` checks saved application
+  bytes against their vectors, embedded identity and original CRC, normalizing
+  the bootloader's committed size/CRC fields during CRC calculation.
+- A public firmware mirror in `km003c-resources`, with 21 validated manufacturer
+  packages, release notes and unique build IDs. Native and browser library users
+  can parse the JSON catalog and validate complete package SHA-256/size as well
+  as firmware CRC and identity. Version-only selection rejects ambiguous builds.
+- Experimental firmware package and bootloader APIs, with unified CLI commands
+  for official release listing/download, local inspection, device checks and
+  installation of newer, older or same-version images. Updates preserve an
+  application backup, use a stable USB port across DFU transitions, and verify
+  full readback including the bootloader's final metadata patch. The complete
+  1.9.9 -> 2.0.7 -> original 1.9.9 cycle passed on hardware 2.1, with matching
+  final application bytes and an unchanged acquired bootloader region.
+- This fork's standalone local-file updater is available as
+  `km003c-firmware-manual`, with its API in the `km003c-firmware-manual` crate, alongside the
+  upstream firmware API, unified CLI and graphical updater.
 - The release workflow builds `km003c` wheels for Linux, macOS and Windows on
   both x86-64 and arm64 plus a source distribution, and uploads them to PyPI
   through trusted publishing, so `pip install km003c` no longer requires a Rust
@@ -40,17 +69,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Firmware listing and downloads use the public mirror without authorization.
+  The official OSS backend and encrypted credentials remain in the library,
+  disabled from default paths while the vendor credential is inactive. Original
+  applications, manuals and historical `orig_app` snapshots are archived as
+  `km003c-resources` Release assets, outside the current source tree.
+- Protocol AES keys and official catalog credentials are stored as encrypted
+  embedded values and decoded once in memory, without external files. The
+  wrapping key is bundled too; this conceals plaintext literals rather than
+  preventing extraction. The public `auth` key constants are now
+  `LazyLock<[u8; 16]>` statics: borrow with `&MEMORY_READ_KEY`, or use
+  `&*MEMORY_READ_KEY` where a generic conversion requires the array reference.
+- One clap-based `km003c` executable replaces the six CLI binaries, with
+  `info`, `adc`, `logs`, `pd`, and `debug memory` commands and shared USB,
+  device-selection, and logging options. Existing scripts must use the new
+  subcommands. `logs download` requires `--index` or `--latest`; `--latest`
+  selects the highest numbered `A<number>.d` filename. CSV export now uses
+  the shared 23-column recording schema, Parquet export is available, and
+  the output extension selects the format unless `--format` is supplied.
 - The Python extension is built against the stable ABI (`abi3-py38`). One wheel
   per platform now covers every CPython from 3.8 up, and a new interpreter
   release needs no rebuild.
 
 ### Fixed
 
-- Memory reads now honor the encryption flag in the confirmation header.
-  KM003C firmware 2.0.5 returns device information, calibration, and hardware
-  ID as padded plaintext; decrypting them produced garbage and caused
-  StreamingAuth to remain at level 0. On a KM003C running 2.0.5 this restores
-  device information and authenticated AdcQueue streaming at 50 and 1000 SPS.
+- Concurrent recording exports use separate temporary files and replace completed
+  files atomically, preserving the destination when a write or replacement fails.
+- Live measurements, integrals and PD history reset when a different meter or
+  firmware build connects; buffer exports retain their source metadata across detach.
+- Cable-addressed PD messages no longer advance or clear the SOP power contract.
+- Browser recordings and exports hold a shared navigation warning until their
+  work completes, independently of firmware installation.
+- Every attribute-set constructor masks unknown attributes to the 15-bit wire
+  field, avoiding serialization panics for out-of-range values.
+- MemoryRead follows each confirmation's encryption flag and splits requests at
+  2528 bytes. The inspected 2.0.5 application marks responses plaintext while
+  encrypting complete 2544-byte blocks; bounded requests avoid that mixed path
+  for initialization, offline logs and application backup/readback. Invalid
+  ranges are rejected before USB traffic; no version-based decoding guesses
+  are made. This also prevents plaintext device information and hardware IDs
+  from being decrypted into garbage and breaking streaming authentication.
+- Firmware preparation validates backup vectors, identity and normalized CRC
+  before exposing a backup or entering DFU. Two identically corrupted reads no
+  longer qualify as a verified application backup.
+- The PD Status contract keeps a fixed two-line row inside the sidebar column.
+  Longer negotiation text is elided and shown on hover, so the sections below
+  no longer jump and the label does not widen the panel.
+- Offline recordings whose catalog charge and energy lead the last sample by
+  at most one logging interval now download. Firmware 2.0.6 writes those header
+  totals when recording stops, and the previous exact comparison rejected the
+  recording.
 - The source distribution now contains the two license files it names in its
   metadata. PyPI rejects an sdist whose `License-File` entries are missing from
   the archive, which is why 0.4.0 reached PyPI as wheels only.

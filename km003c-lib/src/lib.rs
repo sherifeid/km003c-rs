@@ -3,16 +3,16 @@ pub mod adcqueue;
 pub mod auth;
 pub mod constants;
 pub mod device;
+mod embedded_keys;
 pub mod error;
 pub mod firmware;
 pub mod measurement;
+mod memory;
 pub mod message;
 pub mod offline;
 pub mod offline_view;
 pub mod packet;
 pub mod pd;
-#[cfg(feature = "usbpd")]
-pub mod pd_cable;
 pub mod pd_connection;
 #[cfg(feature = "usbpd")]
 pub mod pd_contract;
@@ -39,28 +39,18 @@ pub use adcqueue::{
 };
 pub use auth::{AuthCredential, DeviceInfo, HardwareId, StreamingAuthResult};
 pub use device::{ConnectionMode, DeviceConfig, DeviceSelector, DeviceState, KM003C, TransferType};
-pub use firmware::{
-    FirmwareImage, FirmwareMetadata, FirmwareUpdateProgress, FirmwareUpdateStage, FirmwareUsbDevice, FirmwareUsbMode,
-    find_firmware_device,
-};
 pub use measurement::{MeasurementAccumulator, MeasurementSample, Metric};
 pub use message::{Packet, PayloadData};
 pub use offline::{LogMetadata, LogMetadataResponse, OfflineLog, OfflineLogSample, OfflineLogSampleRaw};
 pub use offline_view::{OfflineRecordingView, OfflineViewSample};
 pub use packet::{Attribute, AttributeSet, LogicalPacket, PacketPeek, RawPacket};
 pub use pd::{PdEvent, PdEventData, PdEventStream, PdStatus};
-#[cfg(feature = "usbpd")]
-pub use pd_cable::{
-    PdActiveCableDetails, PdCableActiveElement, PdCableConnector, PdCableCurrent, PdCableIdentity, PdCableKind,
-    PdCableLatency, PdCableMedium, PdCableSpeed, PdCableTermination, PdCableVoltage,
-};
 pub use pd_connection::PdConnectionTracker;
 #[cfg(feature = "usbpd")]
 pub use pd_contract::{PdContract, PdContractStage};
 #[cfg(feature = "usbpd")]
 pub use pd_decode::{
-    DecodedPdEvent, DecodedPdMessage, PdChunkState, PdChunkStatus, PdDecodeError, PdDecodeFailure, PdIdentity,
-    PdRevision, PdSessionDecoder,
+    DecodedPdEvent, DecodedPdMessage, PdChunkState, PdChunkStatus, PdDecodeError, PdDecodeFailure, PdSessionDecoder,
 };
 #[cfg(feature = "usbpd")]
 pub use pd_log::{PdLogCategory, PdLogEntry, PdLogger};
@@ -71,7 +61,7 @@ pub use pd_trace::{
 #[cfg(feature = "polars")]
 pub use polars;
 #[cfg(feature = "preferences")]
-pub use preferences::{Preferences, PreferencesError};
+pub use preferences::{PlotScaleMode, PlotScaleSettings, Preferences, PreferencesError};
 #[cfg(all(target_arch = "wasm32", feature = "browser"))]
 pub use recording::{OfflineExport, OfflineExportEvent, Recorder, RecordingError, RecordingEvent};
 #[cfg(feature = "polars")]

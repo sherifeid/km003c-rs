@@ -14,11 +14,9 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
-use uom::si::thermodynamic_temperature::degree_celsius;
 
-use crate::adc::AdcDataSimple;
 use crate::device::{PID, VID};
 use crate::error::KMError;
 use crate::packet::{Attribute, AttributeSet};
@@ -36,8 +34,6 @@ const MAX_ERRORS: u32 = 10;
 /// such as while a phone sleeps, yet keeps answering PD requests. At the
 /// slowest rate a sample is due every 0.5 s.
 const STALL_TIMEOUT: Duration = Duration::from_secs(3);
-/// Slow telemetry absent from AdcQueue, including temperature and internal VDD.
-const ADC_TELEMETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What the session task reports to the front end.
 #[derive(Debug, Clone)]
@@ -51,8 +47,6 @@ pub enum SessionEvent {
     ConnectionFailed { error: String, retry_when_present: bool },
     /// New AdcQueue samples.
     Samples(Vec<AdcQueueSample>),
-    /// Periodic single-shot ADC telemetry collected without stopping AdcQueue.
-    AdcUpdate(AdcDataSimple),
     /// PD events from the device's PD monitor.
     PdEvents(Vec<PdEvent>),
     /// PD status (CC line voltages).
@@ -95,6 +89,8 @@ pub enum SessionCommand {
     },
     /// Change the sample rate (restarts streaming).
     SetSampleRate(GraphSampleRate),
+    /// Start or stop acquisition while retaining the initialized USB session.
+    SetStreaming(bool),
     /// Enable or disable firmware PD trace collection.
     SetPdTraceEnabled(bool),
     /// Fetch the catalog of recordings stored by the device.
@@ -103,6 +99,9 @@ pub enum SessionCommand {
     DownloadOfflineLog(LogMetadata),
     /// Stop streaming and disconnect.
     Disconnect,
+    /// An idle-loop barrier used after Disconnect. Never acknowledges an open session.
+    #[doc(hidden)]
+    AwaitIdle(oneshot::Sender<()>),
 }
 
 /// The session task has stopped, so the command was not delivered.
@@ -170,6 +169,10 @@ impl Session {
         self.send(SessionCommand::SetSampleRate(rate))
     }
 
+    pub fn set_streaming(&self, enabled: bool) -> Result<(), SessionClosed> {
+        self.send(SessionCommand::SetStreaming(enabled))
+    }
+
     pub fn set_pd_trace_enabled(&self, enabled: bool) -> Result<(), SessionClosed> {
         self.send(SessionCommand::SetPdTraceEnabled(enabled))
     }
@@ -184,6 +187,17 @@ impl Session {
 
     pub fn disconnect(&self) -> Result<(), SessionClosed> {
         self.send(SessionCommand::Disconnect)
+    }
+
+    /// Disconnect and wait until discovery/streaming has returned and released USB.
+    ///
+    /// Frontends must stop sending connection commands until maintenance completes.
+    /// A competing connection fails the barrier rather than granting USB ownership.
+    pub async fn disconnect_and_wait(&self) -> Result<(), SessionClosed> {
+        let (tx, rx) = oneshot::channel();
+        self.disconnect()?;
+        self.send(SessionCommand::AwaitIdle(tx))?;
+        rx.await.map_err(|_| SessionClosed)
     }
 }
 
@@ -226,6 +240,9 @@ pub async fn run(tx: mpsc::UnboundedSender<SessionEvent>, mut cmd_rx: mpsc::Unbo
                 let _ = tx.send(SessionEvent::Disconnected {
                     retry_when_present: false,
                 });
+            }
+            SessionCommand::AwaitIdle(reply) => {
+                let _ = reply.send(());
             }
             command => debug!("Ignoring command while disconnected: {command:?}"),
         }
@@ -377,9 +394,6 @@ async fn stream(
     // Initial StopGraph to ensure clean state
     info!("Sending initial StopGraph to ensure clean state");
     let _ = device.stop_graph_mode().await;
-    if let Err(error) = device.enable_pd_monitor().await {
-        warn!("Could not explicitly enable PD monitoring; continuing with status polling: {error}");
-    }
 
     let mut current_rate = initial_rate;
     if let Err(e) = start_streaming(&mut device, current_rate, tx).await {
@@ -398,16 +412,35 @@ async fn stream(
     let mut reconnect_when_present = false;
     let mut terminal_error = None;
     let mut last_samples = Instant::now();
-    let mut last_adc_telemetry = Instant::now();
+    let mut acquiring = true;
 
     loop {
         // Check for commands from the UI (non-blocking)
         match cmd_rx.try_recv() {
+            Ok(SessionCommand::SetStreaming(enabled)) => {
+                if enabled != acquiring {
+                    let result = if enabled {
+                        start_streaming(&mut device, current_rate, tx).await
+                    } else {
+                        device.stop_graph_mode().await
+                    };
+                    if let Err(error) = result {
+                        reconnect_when_present = is_device_disconnect(&error);
+                        terminal_error = Some(format!("Could not change acquisition state: {error}"));
+                        break;
+                    }
+                    acquiring = enabled;
+                    last_samples = Instant::now();
+                    if !enabled {
+                        let _ = tx.send(SessionEvent::StreamingStopped);
+                    }
+                }
+            }
             Ok(SessionCommand::SetSampleRate(new_rate)) => {
                 if new_rate != current_rate {
                     info!("Changing sample rate to {:?}", new_rate);
 
-                    if let Err(e) = restart_streaming(&mut device, new_rate, tx).await {
+                    if acquiring && let Err(e) = restart_streaming(&mut device, new_rate, tx).await {
                         error!("Failed to restart streaming: {}", e);
                         reconnect_when_present = is_device_disconnect(&e);
                         terminal_error = Some(format!("Restart failed: {e}"));
@@ -426,13 +459,15 @@ async fn stream(
             }
             Ok(SessionCommand::RequestOfflineCatalog) => {
                 info!("Loading offline recording catalog");
-                if let Err(error) = device.stop_graph_mode().await {
+                if acquiring && let Err(error) = device.stop_graph_mode().await {
                     let _ = tx.send(SessionEvent::OfflineOperationFailed(format!(
                         "Could not pause streaming for offline catalog access: {error}"
                     )));
                     continue;
                 }
-                let _ = tx.send(SessionEvent::StreamingStopped);
+                if acquiring {
+                    let _ = tx.send(SessionEvent::StreamingStopped);
+                }
                 match device.request_log_metadata().await {
                     Ok(catalog) => {
                         let _ = tx.send(SessionEvent::OfflineCatalog(catalog));
@@ -443,7 +478,7 @@ async fn stream(
                         )));
                     }
                 }
-                if let Err(error) = start_streaming(&mut device, current_rate, tx).await {
+                if acquiring && let Err(error) = start_streaming(&mut device, current_rate, tx).await {
                     reconnect_when_present = is_device_disconnect(&error);
                     terminal_error = Some(format!(
                         "Failed to resume streaming after loading offline catalog: {error}"
@@ -458,13 +493,15 @@ async fn stream(
                     samples = metadata.sample_count,
                     "Downloading offline recording"
                 );
-                if let Err(error) = device.stop_graph_mode().await {
+                if acquiring && let Err(error) = device.stop_graph_mode().await {
                     let _ = tx.send(SessionEvent::OfflineOperationFailed(format!(
                         "Could not pause streaming for offline download: {error}"
                     )));
                     continue;
                 }
-                let _ = tx.send(SessionEvent::StreamingStopped);
+                if acquiring {
+                    let _ = tx.send(SessionEvent::StreamingStopped);
+                }
                 match device.download_offline_log(metadata).await {
                     Ok(log) => {
                         let _ = tx.send(SessionEvent::OfflineLogDownloaded(log));
@@ -475,7 +512,7 @@ async fn stream(
                         )));
                     }
                 }
-                if let Err(error) = start_streaming(&mut device, current_rate, tx).await {
+                if acquiring && let Err(error) = start_streaming(&mut device, current_rate, tx).await {
                     reconnect_when_present = is_device_disconnect(&error);
                     terminal_error = Some(format!("Failed to resume streaming after offline download: {error}"));
                     break;
@@ -486,6 +523,10 @@ async fn stream(
                 info!("Disconnect command received");
                 reconnect_when_present = false;
                 break;
+            }
+            Ok(SessionCommand::AwaitIdle(_)) => {
+                // A competing connection consumed Disconnect. Fail the barrier
+                // instead of letting maintenance race this live USB handle.
             }
             Ok(
                 command @ (SessionCommand::Connect { .. }
@@ -502,27 +543,14 @@ async fn stream(
             }
         }
 
-        // Keep draining AdcQueue while periodically adding slow ADC telemetry.
-        let request_adc = last_adc_telemetry.elapsed() >= ADC_TELEMETRY_INTERVAL;
-        if request_adc {
-            // Keep the request cadence bounded even if this firmware omits ADC
-            // from a chained response.
-            last_adc_telemetry = Instant::now();
-        }
-        let mask = streaming_attribute_mask(pd_trace_enabled, request_adc);
+        // Request the regular streams and the opt-in firmware trace.
+        let mask = acquisition_attribute_mask(acquiring, pd_trace_enabled);
         match device.request_data(mask).await {
             Ok(packet) => {
                 error_count = 0;
 
-                if let Some(adc) = packet.get_adc() {
-                    let temperature_c = adc.temperature.get::<degree_celsius>();
-                    if temperature_poll_is_empty(temperature_c) {
-                        warn!(temperature_c, "Temperature poll was empty");
-                    }
-                    let _ = tx.send(SessionEvent::AdcUpdate(*adc));
-                }
-
-                if let Some(queue_data) = packet.get_adc_queue()
+                if acquiring
+                    && let Some(queue_data) = packet.get_adc_queue()
                     && !queue_data.samples.is_empty()
                 {
                     debug!("Received {} samples", queue_data.samples.len());
@@ -531,7 +559,7 @@ async fn stream(
                         warn!("UI closed, stopping");
                         break;
                     }
-                } else if last_samples.elapsed() >= STALL_TIMEOUT {
+                } else if acquiring && last_samples.elapsed() >= STALL_TIMEOUT {
                     warn!(
                         "No AdcQueue samples for {:.1} s, restarting streaming",
                         last_samples.elapsed().as_secs_f32()
@@ -573,18 +601,23 @@ async fn stream(
             }
         }
 
-        // While a browser tab is hidden, setTimeout is clamped to about a
-        // second. Sleeping here would let the device queue overflow, and the
-        // plot would connect the surviving samples with a straight line.
-        // The USB read above already yields, so skip the pause.
-        if let Some(delay) = poll_delay(current_rate, crate::runtime::browser_timers_throttled()) {
-            crate::runtime::sleep(delay).await;
-        }
+        // Poll often enough that the device queue never overflows.
+        let delay_ms = if !acquiring {
+            100
+        } else {
+            match current_rate {
+                GraphSampleRate::Sps2 => 200,  // 5 requests/sec for 2 SPS
+                GraphSampleRate::Sps10 => 50,  // 20 requests/sec for 10 SPS
+                GraphSampleRate::Sps50 => 20,  // 50 requests/sec for 50 SPS
+                GraphSampleRate::Sps1000 => 5, // 200 requests/sec for 1000 SPS
+            }
+        };
+        crate::runtime::sleep(Duration::from_millis(delay_ms)).await;
     }
 
     info!("Stopping streaming");
     let _ = device.stop_graph_mode().await;
-    let _ = device.disable_pd_monitor().await;
+    drop(device);
     let _ = tx.send(SessionEvent::Disconnected {
         retry_when_present: reconnect_when_present,
     });
@@ -593,30 +626,13 @@ async fn stream(
     }
 }
 
-/// The temperature register is i16::MIN, -256°C, when the meter has no conversion.
-fn temperature_poll_is_empty(celsius: f64) -> bool {
-    !celsius.is_finite() || celsius <= -256.0
-}
-
-/// Pause between graph polls, or `None` when a timer pause would be clamped.
-fn poll_delay(rate: GraphSampleRate, timers_throttled: bool) -> Option<Duration> {
-    if timers_throttled {
-        return None;
-    }
-    // Often enough that the device queue does not overflow.
-    Some(Duration::from_millis(match rate {
-        GraphSampleRate::Sps2 => 200,  // 5 requests/sec for 2 SPS
-        GraphSampleRate::Sps10 => 50,  // 20 requests/sec for 10 SPS
-        GraphSampleRate::Sps50 => 20,  // 50 requests/sec for 50 SPS
-        GraphSampleRate::Sps1000 => 5, // 200 requests/sec for 1000 SPS
-    }))
-}
-
-fn streaming_attribute_mask(pd_trace_enabled: bool, adc_telemetry: bool) -> AttributeSet {
-    let mut mask = AttributeSet::single(Attribute::AdcQueue).with(Attribute::PdPacket);
-    if adc_telemetry {
-        mask = mask.with(Attribute::Adc);
-    }
+fn acquisition_attribute_mask(acquiring: bool, pd_trace_enabled: bool) -> AttributeSet {
+    let mask = AttributeSet::single(Attribute::PdPacket);
+    let mask = if acquiring {
+        mask.with(Attribute::AdcQueue)
+    } else {
+        mask
+    };
     if pd_trace_enabled {
         mask.with(Attribute::PdTrace)
     } else {
@@ -649,49 +665,54 @@ async fn restart_streaming(
 mod tests {
     use super::*;
 
-    #[test]
-    fn empty_temperature_register_is_not_a_reading() {
-        assert!(temperature_poll_is_empty(-256.0));
-        assert!(temperature_poll_is_empty(f64::NAN));
-        assert!(!temperature_poll_is_empty(31.2));
-        assert!(!temperature_poll_is_empty(-255.99));
+    #[tokio::test]
+    async fn maintenance_waits_for_the_idle_acknowledgement() {
+        let (session, mut commands) = Session::detached();
+        let release = tokio::spawn(async move { session.disconnect_and_wait().await });
+        assert!(matches!(commands.recv().await, Some(SessionCommand::Disconnect)));
+        let Some(SessionCommand::AwaitIdle(reply)) = commands.recv().await else {
+            panic!("missing idle barrier")
+        };
+        assert!(!release.is_finished(), "disconnect alone must not grant USB ownership");
+        reply.send(()).unwrap();
+        assert_eq!(release.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn lost_idle_barrier_fails_maintenance_closed() {
+        let (session, mut commands) = Session::detached();
+        let release = tokio::spawn(async move { session.disconnect_and_wait().await });
+        assert!(matches!(commands.recv().await, Some(SessionCommand::Disconnect)));
+        drop(commands.recv().await);
+        assert_eq!(release.await.unwrap(), Err(SessionClosed));
+    }
+
+    #[tokio::test]
+    async fn idle_worker_releases_without_discovering_hardware() {
+        let (session, mut events) = Session::spawn();
+        session.disconnect_and_wait().await.unwrap();
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SessionEvent::Disconnected {
+                retry_when_present: false
+            })
+        ));
     }
 
     #[test]
-    fn background_tabs_do_not_sleep_between_graph_polls() {
-        assert_eq!(poll_delay(GraphSampleRate::Sps1000, true), None);
-        assert_eq!(poll_delay(GraphSampleRate::Sps2, true), None);
-        assert_eq!(
-            poll_delay(GraphSampleRate::Sps1000, false),
-            Some(Duration::from_millis(5))
-        );
-        assert_eq!(
-            poll_delay(GraphSampleRate::Sps50, false),
-            Some(Duration::from_millis(20))
-        );
-        assert_eq!(
-            poll_delay(GraphSampleRate::Sps10, false),
-            Some(Duration::from_millis(50))
-        );
-        assert_eq!(
-            poll_delay(GraphSampleRate::Sps2, false),
-            Some(Duration::from_millis(200))
-        );
-    }
-
-    #[test]
-    fn optional_streaming_attributes_are_only_requested_when_due() {
-        let disabled = streaming_attribute_mask(false, false);
+    fn firmware_trace_is_only_requested_when_enabled() {
+        let disabled = acquisition_attribute_mask(true, false);
         assert!(disabled.contains(Attribute::AdcQueue));
         assert!(disabled.contains(Attribute::PdPacket));
-        assert!(!disabled.contains(Attribute::Adc));
         assert!(!disabled.contains(Attribute::PdTrace));
 
-        let enabled = streaming_attribute_mask(true, true);
+        let enabled = acquisition_attribute_mask(true, true);
         assert!(enabled.contains(Attribute::AdcQueue));
         assert!(enabled.contains(Attribute::PdPacket));
-        assert!(enabled.contains(Attribute::Adc));
         assert!(enabled.contains(Attribute::PdTrace));
+        let stopped = acquisition_attribute_mask(false, false);
+        assert!(!stopped.contains(Attribute::AdcQueue));
+        assert!(stopped.contains(Attribute::PdPacket));
     }
 
     #[test]
@@ -740,6 +761,10 @@ mod tests {
             commands.try_recv(),
             Ok(SessionCommand::SetSampleRate(GraphSampleRate::Sps1000))
         ));
+        session.set_streaming(false).unwrap();
+        session.set_streaming(true).unwrap();
+        assert!(matches!(commands.try_recv(), Ok(SessionCommand::SetStreaming(false))));
+        assert!(matches!(commands.try_recv(), Ok(SessionCommand::SetStreaming(true))));
         drop(commands);
         assert_eq!(session.disconnect(), Err(SessionClosed));
     }

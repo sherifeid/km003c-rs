@@ -199,12 +199,12 @@ mod tests {
             time: "19:23:34.479".to_string(),
             level: level_label(Level::WARN).to_string(),
             level_color: level_color(Level::WARN),
-            target: "km003c_lib::session".to_string(),
+            target: "km003c_scope_core::session".to_string(),
             message: "Temperature poll was empty  temperature_c=-256.0".to_string(),
         };
         assert_eq!(
             format_line(&line),
-            "19:23:34.479  WARN km003c_lib::session: Temperature poll was empty  temperature_c=-256.0"
+            "19:23:34.479  WARN km003c_scope_core::session: Temperature poll was empty  temperature_c=-256.0"
         );
     }
 

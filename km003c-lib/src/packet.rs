@@ -80,7 +80,7 @@ pub enum PacketType {
     DisablePdMonitor = 0x11, // Disable PD sniffer/capture
 
     // Authentication commands
-    MemoryRead = 0x44,    // 68 - Read device memory (encrypted)
+    MemoryRead = 0x44,    // 68 - Read memory; response header flags its encoding
     StreamingAuth = 0x4C, // 76 - Authenticate for AdcQueue streaming
 
     // Error responses
@@ -210,27 +210,27 @@ impl AttributeSet {
     }
 
     pub fn single(attr: Attribute) -> Self {
-        Self { mask: attr.into() }
+        Self::from_raw(attr.into())
     }
 
     pub fn from_attributes<I>(attrs: I) -> Self
     where
         I: IntoIterator<Item = Attribute>,
     {
-        Self {
-            mask: attrs
+        Self::from_raw(
+            attrs
                 .into_iter()
                 .map(|a| {
                     let val: u16 = a.into();
                     val
                 })
                 .fold(0, |acc, x| acc | x),
-        }
+        )
     }
 
     pub fn with(mut self, attr: Attribute) -> Self {
         let val: u16 = attr.into();
-        self.mask |= val;
+        self.mask = (self.mask | val) & Self::WIRE_MASK;
         self
     }
 

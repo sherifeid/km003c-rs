@@ -1,0 +1,24 @@
+[package]
+name = "km003c-scope-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+km003c-lib = { workspace = true, features = ["usbpd"] }
+tokio.workspace = true
+tracing.workspace = true
+uom.workspace = true
+usbpd.workspace = true
+thiserror = "2.0.19"
+futures-util = { version = "0.3.34", default-features = false }
+nusb = "0.2.7"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["Window", "Document"] }
+
+[dev-dependencies]
+bytes = "1.12.1"
+hex = "0.4"

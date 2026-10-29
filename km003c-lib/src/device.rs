@@ -155,7 +155,6 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 const BULK_TRANSFER_SIZE: usize = 2048;
 const INTERRUPT_TRANSFER_SIZE: usize = 64;
 const MAX_PENDING_RESPONSES: usize = 256;
-const AES_BLOCK_SIZE: usize = 16;
 
 /// Find one attached KM003C matching `selector`.
 async fn find_device(selector: &DeviceSelector) -> Result<nusb::DeviceInfo, KMError> {
@@ -185,101 +184,6 @@ fn memory_confirmation_matches(bytes: &[u8], id: u8) -> bool {
                 PacketType::MemoryRead | PacketType::Rejected | PacketType::NotReadable
             )
     })
-}
-
-fn memory_response_size(requested_size: u32) -> usize {
-    (requested_size as usize).div_ceil(AES_BLOCK_SIZE) * AES_BLOCK_SIZE
-}
-
-fn append_memory_chunk(buffer: &mut Vec<u8>, chunk: &[u8], expected_size: usize) -> Result<bool, KMError> {
-    if chunk.is_empty() {
-        return Err(KMError::Protocol("Received an empty memory chunk".to_string()));
-    }
-
-    let remaining = expected_size.saturating_sub(buffer.len());
-    if chunk.len() > remaining {
-        return Err(KMError::Protocol(format!(
-            "Memory response exceeded expected size: expected {expected_size} bytes, got at least {}",
-            buffer.len() + chunk.len()
-        )));
-    }
-
-    buffer.extend_from_slice(chunk);
-    Ok(buffer.len() == expected_size)
-}
-
-fn decode_memory_response(bytes: &[u8], requested_size: u32, encrypted: bool) -> Result<Vec<u8>, KMError> {
-    // Transfers are padded to AES blocks even when the confirmation marks
-    // their contents as plaintext.
-    let expected_size = memory_response_size(requested_size);
-    if bytes.len() != expected_size {
-        return Err(KMError::Protocol(format!(
-            "Memory response has the wrong size: expected {expected_size} bytes, got {}",
-            bytes.len()
-        )));
-    }
-
-    if encrypted {
-        let mut decrypted = crate::auth::aes_ecb_decrypt_blocks(bytes, crate::auth::MEMORY_READ_KEY)?;
-        decrypted.truncate(requested_size as usize);
-        Ok(decrypted)
-    } else {
-        Ok(bytes[..requested_size as usize].to_vec())
-    }
-}
-
-fn validate_memory_read_confirmation(
-    packet: &RawPacket,
-    expected_id: u8,
-    expected_address: u32,
-    expected_size: u32,
-) -> Result<bool, KMError> {
-    let RawPacket::SimpleData { header, payload } = packet else {
-        return Err(KMError::Protocol(
-            "MemoryRead confirmation has an unexpected packet layout".to_string(),
-        ));
-    };
-
-    if header.id() != expected_id || PacketType::from(header.packet_type()) != PacketType::MemoryRead {
-        return Err(KMError::Protocol(
-            "MemoryRead confirmation does not match the request".to_string(),
-        ));
-    }
-    if payload.len() != crate::auth::MEMORY_READ_CONFIRMATION_SIZE {
-        return Err(KMError::Protocol(format!(
-            "MemoryRead confirmation must contain {} bytes, got {}",
-            crate::auth::MEMORY_READ_CONFIRMATION_SIZE,
-            payload.len()
-        )));
-    }
-
-    let confirmation = crate::auth::MemoryReadConfirmation::from_bytes(payload)
-        .ok_or_else(|| KMError::Protocol("MemoryRead confirmation body is truncated".to_string()))?;
-
-    if confirmation.address != expected_address || confirmation.size != expected_size {
-        return Err(KMError::Protocol(format!(
-            "MemoryRead confirmation echoed address 0x{:08X} and size {}, expected 0x{expected_address:08X} and {expected_size}",
-            confirmation.address, confirmation.size
-        )));
-    }
-    if confirmation.magic != u32::MAX {
-        return Err(KMError::Protocol(format!(
-            "MemoryRead confirmation has invalid magic 0x{:08X}",
-            confirmation.magic
-        )));
-    }
-    if confirmation.checksum != confirmation.expected_checksum {
-        return Err(KMError::Protocol(format!(
-            "MemoryRead confirmation CRC mismatch: expected 0x{:08X}, got 0x{:08X}",
-            confirmation.expected_checksum, confirmation.checksum
-        )));
-    }
-
-    // Bit 0 of byte 2 in the confirmation indicates AES-encrypted data.
-    // Current KM003C firmware returns ordinary info and calibration blocks
-    // as plaintext; blindly decrypting those blocks produces plausible-sized
-    // garbage and then authenticates with a false hardware ID.
-    Ok(header.into_bytes()[2] & 1 != 0)
 }
 
 /// Transfer type for USB communication
@@ -369,8 +273,8 @@ pub enum DeviceSelector {
     /// The address changes across a USB reset, so prefer
     /// [`DeviceSelector::SerialNumber`] together with `skip_reset()`.
     BusAddress { bus_id: String, device_address: u8 },
-    /// Match a physical USB port across a device reboot or DFU transition.
-    /// Available on macOS, Linux and Windows.
+    /// Physical port, stable when rebooting between application and bootloader.
+    /// Available on Linux, macOS and Windows.
     PortPath { bus_id: String, port_chain: Vec<u8> },
 }
 
@@ -387,9 +291,7 @@ impl DeviceSelector {
             Self::PortPath { bus_id, port_chain } => device.bus_id() == bus_id && device.port_chain() == port_chain,
             // Android and WebUSB expose no bus topology.
             #[cfg(any(target_os = "android", target_arch = "wasm32"))]
-            Self::BusAddress { .. } => false,
-            #[cfg(any(target_os = "android", target_arch = "wasm32"))]
-            Self::PortPath { .. } => false,
+            Self::BusAddress { .. } | Self::PortPath { .. } => false,
         }
     }
 
@@ -526,19 +428,19 @@ pub struct KM003C {
 }
 
 impl KM003C {
-    /// Open the vendor interface without resetting or initializing the device.
+    /// Claim the vendor interface without application initialization or USB reset.
     ///
-    /// Firmware DFU mode does not support the normal application initialization
-    /// sequence. Use this entry point only with command-specific maintenance APIs.
-    pub async fn open_maintenance(config: DeviceConfig) -> Result<Self, KMError> {
-        if !config.is_vendor() {
-            return Err(KMError::Protocol(
-                "firmware maintenance requires the vendor interface".into(),
-            ));
-        }
-        Self::connect(config.skip_reset()).await
+    /// Used for firmware maintenance, including when application commands are
+    /// unavailable in DFU. This does not send Connect or change device mode.
+    pub async fn open_maintenance(selector: DeviceSelector) -> Result<Self, KMError> {
+        Self::connect(DeviceConfig::vendor().skip_reset().select(selector)).await
     }
 
+    pub(crate) fn firmware_transport_available(&self) -> bool {
+        matches!(self.writer, EndpointWriterType::Bulk(_))
+            && matches!(self.mode, ConnectionMode::Basic)
+            && self.pending_responses.is_empty()
+    }
     /// Connect to device with the given configuration
     ///
     /// The config determines the connection mode:
@@ -605,24 +507,18 @@ impl KM003C {
 
         let mut device = timeout(DEFAULT_TIMEOUT, async { device_info.open().await }).await??;
 
-        // Optionally reset device (skip on MacOS if having issues).
+        // Optionally reset device (skip on MacOS if having issues)
         if !config.skip_reset {
             info!("Resetting device...");
-            match device.reset().await {
-                Ok(()) => {
-                    // The device needs 1.5 seconds to fully initialize after reset.
-                    crate::runtime::sleep(Duration::from_millis(1500)).await;
-                    // Re-enumerate and reopen after reset (old handle may be invalid).
-                    device = timeout(DEFAULT_TIMEOUT, async {
-                        find_device(&reopen_selector).await?.open().await.map_err(KMError::from)
-                    })
-                    .await??;
-                }
-                Err(error) if error.kind() == nusb::ErrorKind::Unsupported => {
-                    warn!("USB reset is not supported by this platform or driver; continuing without reset");
-                }
-                Err(error) => return Err(error.into()),
-            }
+            device.reset().await?;
+            // CRITICAL: Device needs 1.5 seconds to fully initialize after reset
+            // (validated through protocol research - 100ms is insufficient for AdcQueue)
+            crate::runtime::sleep(Duration::from_millis(1500)).await;
+            // Re-enumerate and reopen after reset (old handle may be invalid).
+            device = timeout(DEFAULT_TIMEOUT, async {
+                find_device(&reopen_selector).await?.open().await.map_err(KMError::from)
+            })
+            .await??;
         } else {
             debug!("Skipping USB reset (skip_reset=true)");
         }
@@ -816,6 +712,10 @@ impl KM003C {
 
     /// Read one complete response directly from the USB endpoint.
     async fn read_raw_from_usb(&mut self) -> Result<Vec<u8>, KMError> {
+        self.read_raw_with_timeout(DEFAULT_TIMEOUT).await
+    }
+
+    pub(crate) async fn read_raw_with_timeout(&mut self, duration: Duration) -> Result<Vec<u8>, KMError> {
         let mut buffer = Vec::new();
         let bytes_read = match &mut self.reader {
             EndpointReaderType::Bulk(reader) => {
@@ -823,7 +723,7 @@ impl KM003C {
                 // this adapter preserves one complete protocol response even when it
                 // is larger than either the caller's buffer or one 2048-byte transfer.
                 let mut message = reader.until_short_packet();
-                let bytes_read = timeout(DEFAULT_TIMEOUT, message.read_to_end(&mut buffer)).await??;
+                let bytes_read = timeout(duration, message.read_to_end(&mut buffer)).await??;
                 message
                     .consume_end()
                     .map_err(|_| KMError::Protocol("Bulk response ended without a short packet".to_string()))?;
@@ -831,7 +731,7 @@ impl KM003C {
             }
             EndpointReaderType::Interrupt(reader) => {
                 buffer.resize(INTERRUPT_TRANSFER_SIZE, 0);
-                let bytes_read = timeout(DEFAULT_TIMEOUT, reader.read(&mut buffer)).await??;
+                let bytes_read = timeout(duration, reader.read(&mut buffer)).await??;
                 buffer.truncate(bytes_read);
                 bytes_read
             }
@@ -936,32 +836,6 @@ impl KM003C {
                 "Expected Accept for {command}, got {other:?}"
             ))),
         }
-    }
-
-    /// Read the unframed data that follows a MemoryRead confirmation.
-    ///
-    /// These transfers carry no header. Encrypted responses are indistinguishable
-    /// from a protocol frame, so nothing else may be in flight while they are
-    /// read. [`Self::read_memory_block`] enforces that precondition.
-    async fn receive_memory_read_data_exact(
-        &mut self,
-        requested_size: u32,
-        encrypted: bool,
-    ) -> Result<Vec<u8>, KMError> {
-        let expected_size = memory_response_size(requested_size);
-        if expected_size == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut data = Vec::with_capacity(expected_size);
-        while data.len() < expected_size {
-            let chunk = self.read_raw_from_usb().await?;
-            if append_memory_chunk(&mut data, &chunk, expected_size)? {
-                break;
-            }
-        }
-
-        decode_memory_response(&data, requested_size, encrypted)
     }
 
     /// Request data with a specific attribute set
@@ -1263,11 +1137,14 @@ impl KM003C {
         Ok(result)
     }
 
-    /// Read a memory block from the device
+    /// Read memory using bounded, individually confirmed transactions.
     ///
-    /// Sends a MemoryRead request, receives the confirmation, then receives
-    /// the data. The confirmation flags whether the response must be decrypted.
-    /// Returns exactly `size` bytes; transport padding is removed.
+    /// Requests at most 2528 bytes at a time and follows each confirmation's
+    /// encryption flag. This avoids firmware 2.0.5's mixed encrypted/plaintext
+    /// large responses. Returns exactly `size` bytes, removing transport padding
+    /// from each response. An empty read still validates a zero-length request.
+    /// Requests larger than 4,000,000 bytes or overflowing the padded address
+    /// range fail before any USB traffic.
     ///
     /// # Errors
     ///
@@ -1284,25 +1161,7 @@ impl KM003C {
             ));
         }
 
-        let id = self.send_tracked(Packet::MemoryRead { address, size }).await?;
-        let confirmation = self
-            .receive_matching_raw(|bytes| memory_confirmation_matches(bytes, id))
-            .await?;
-
-        let confirmation = RawPacket::try_from(Bytes::from(confirmation))?;
-        match confirmation.packet_type() {
-            PacketType::MemoryRead => {
-                let encrypted = validate_memory_read_confirmation(&confirmation, id, address, size)?;
-                self.receive_memory_read_data_exact(size, encrypted).await
-            }
-            PacketType::Rejected => Err(KMError::Protocol(format!("MemoryRead at 0x{address:08X} was rejected"))),
-            PacketType::NotReadable => Err(KMError::Protocol(format!(
-                "Memory address 0x{address:08X} is not readable"
-            ))),
-            other => Err(KMError::Protocol(format!(
-                "Expected MemoryRead confirmation, got {other:?}"
-            ))),
-        }
+        crate::memory::read(self, address, size).await
     }
 
     /// Read device information from memory
@@ -1409,25 +1268,6 @@ impl KM003C {
         Ok(())
     }
 
-    /// Change the ADC stream rate, stopping the previous graph session first.
-    ///
-    /// A fresh `StartGraph` request resets the device's sequence timeline, so
-    /// callers that integrate samples should also reset their continuity state.
-    pub async fn set_graph_sample_rate(&mut self, rate: GraphSampleRate) -> Result<(), KMError> {
-        if self.graph_sample_rate == Some(rate) {
-            return Ok(());
-        }
-        if self.graph_sample_rate.is_some() {
-            self.stop_graph_mode().await?;
-        }
-        self.start_graph_mode(rate).await
-    }
-
-    /// Rate selected for the current authenticated ADC stream.
-    pub fn graph_sample_rate(&self) -> Option<GraphSampleRate> {
-        self.graph_sample_rate
-    }
-
     /// Stop AdcQueue graph/streaming mode
     ///
     /// **Requires Full mode** (vendor interface). Will return error in Basic mode.
@@ -1456,6 +1296,20 @@ impl KM003C {
         }
         self.graph_sample_rate = None;
         Ok(())
+    }
+}
+
+impl crate::memory::MemoryReadIo for KM003C {
+    async fn begin_read(&mut self, address: u32, size: u32) -> Result<(u8, RawPacket), KMError> {
+        let id = self.send_tracked(Packet::MemoryRead { address, size }).await?;
+        let bytes = self
+            .receive_matching_raw(|bytes| memory_confirmation_matches(bytes, id))
+            .await?;
+        Ok((id, RawPacket::try_from(Bytes::from(bytes))?))
+    }
+
+    async fn next_transfer(&mut self) -> Result<Vec<u8>, KMError> {
+        self.read_raw_from_usb().await
     }
 }
 
@@ -1505,91 +1359,5 @@ mod tests {
     #[test]
     fn response_type_matching_supports_fixed_id_protocol_exceptions() {
         assert!(response_type_matches(&[0x4c, 0, 3, 2], PacketType::StreamingAuth));
-    }
-
-    #[test]
-    fn memory_response_size_rounds_to_complete_aes_blocks() {
-        assert_eq!(memory_response_size(1), 16);
-        assert_eq!(memory_response_size(12), 16);
-        assert_eq!(memory_response_size(16), 16);
-        assert_eq!(memory_response_size(17), 32);
-        assert_eq!(memory_response_size(64), 64);
-    }
-
-    #[test]
-    fn decrypted_memory_response_is_trimmed_to_the_requested_size() {
-        let ciphertext = crate::auth::build_memory_read_payload(0x4001_0450, 12);
-        let decrypted = decode_memory_response(&ciphertext[..16], 12, true).unwrap();
-
-        assert_eq!(decrypted.len(), 12);
-        assert_eq!(&decrypted[..4], &0x4001_0450_u32.to_le_bytes());
-        assert_eq!(&decrypted[4..8], &12_u32.to_le_bytes());
-        assert_eq!(&decrypted[8..12], &u32::MAX.to_le_bytes());
-    }
-
-    #[test]
-    fn decrypted_memory_response_rejects_an_incorrect_ciphertext_size() {
-        assert!(decode_memory_response(&[0; 32], 12, true).is_err());
-    }
-
-    #[test]
-    fn current_firmware_plaintext_memory_is_not_decrypted() {
-        // Firmware 2.0.5 returned this unencrypted 0x420 block. Its 0xc4
-        // confirmation has byte 2 bit 0 clear. A 12-byte hardware-ID read
-        // also returns one padded 16-byte transfer.
-        let confirmation = hex::decode("c40100012004000040000000ffffffff1b8c1b24").unwrap();
-        let packet = RawPacket::try_from(Bytes::from(confirmation)).unwrap();
-        assert!(!validate_memory_read_confirmation(&packet, 1, 0x420, 64).unwrap());
-
-        let hardware_id = b"89PSCP\x06\xff5,\xff\xff\0\0\0\0";
-        assert_eq!(
-            decode_memory_response(hardware_id, 12, false).unwrap(),
-            &hardware_id[..12]
-        );
-    }
-
-    #[test]
-    fn memory_confirmation_encryption_flag_controls_decryption() {
-        let mut confirmation = hex::decode("c40100012004000040000000ffffffff1b8c1b24").unwrap();
-        confirmation[2] = 1;
-        let packet = RawPacket::try_from(Bytes::from(confirmation)).unwrap();
-        assert!(validate_memory_read_confirmation(&packet, 1, 0x420, 64).unwrap());
-    }
-
-    #[test]
-    fn memory_chunks_accumulate_across_usb_transfers() {
-        // Source: reading_logs0.11; a requested 8336-byte log arrived as
-        // three 2544-byte USB transfers followed by one 704-byte transfer.
-        let mut response = Vec::new();
-        assert!(!append_memory_chunk(&mut response, &vec![0x11; 2544], 8336).unwrap());
-        assert!(!append_memory_chunk(&mut response, &vec![0x22; 2544], 8336).unwrap());
-        assert!(!append_memory_chunk(&mut response, &vec![0x33; 2544], 8336).unwrap());
-        assert!(append_memory_chunk(&mut response, &vec![0x44; 704], 8336).unwrap());
-        assert_eq!(response.len(), 8336);
-    }
-
-    #[test]
-    fn memory_chunks_reject_empty_and_oversized_transfers() {
-        let mut response = vec![0; 15];
-        assert!(append_memory_chunk(&mut response, &[], 16).is_err());
-        assert!(append_memory_chunk(&mut response, &[1, 2], 16).is_err());
-    }
-
-    #[test]
-    fn validates_recorded_memory_read_confirmation() {
-        // Source: usb_master_dataset.parquet, orig_adc_1000hz.6, frame 264.
-        let bytes = hex::decode("c40201012004000040000000ffffffff1b8c1b24").unwrap();
-        let packet = RawPacket::try_from(Bytes::from(bytes)).unwrap();
-
-        validate_memory_read_confirmation(&packet, 2, 0x420, 64).unwrap();
-    }
-
-    #[test]
-    fn rejects_corrupted_memory_read_confirmation() {
-        let mut bytes = hex::decode("c40201012004000040000000ffffffff1b8c1b24").unwrap();
-        bytes[8] ^= 1;
-        let packet = RawPacket::try_from(Bytes::from(bytes)).unwrap();
-
-        assert!(validate_memory_read_confirmation(&packet, 2, 0x420, 64).is_err());
     }
 }
