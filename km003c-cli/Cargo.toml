@@ -4,25 +4,21 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-description = "Command-line tools for the ChargerLAB POWER-Z KM003C"
+description = "Command-line interface for the ChargerLAB POWER-Z KM003C"
 license.workspace = true
 repository.workspace = true
 publish = false
+autobins = false
 
 [[bin]]
-name = "offline-log"
-path = "src/bin/offline_log.rs"
-
-[[bin]]
-name = "firmware-update"
-path = "src/bin/firmware_update.rs"
+name = "km003c"
+path = "src/main.rs"
 
 [dependencies]
-km003c-lib = { workspace = true, features = ["usbpd"] }
+km003c-lib = { workspace = true, features = ["firmware-catalog", "polars", "usbpd"] }
 tokio = { workspace = true, features = ["full"] }
 clap = { version = "4.6.2", features = ["derive"] }
 hex = "0.4"
 serde_json = "1.0.149"
 tracing-subscriber.workspace = true
 tracing.workspace = true
-indicatif = "0.18"

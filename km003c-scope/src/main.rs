@@ -23,32 +23,32 @@ use egui_plot::HPlacement;
 use egui_plot::Line;
 use egui_plot::Plot;
 use egui_plot::PlotPoints;
-use km003c_lib::DeviceState;
-use km003c_lib::GraphSampleRate;
-use km003c_lib::MeasurementAccumulator;
-use km003c_lib::MeasurementSample;
-use km003c_lib::Metric;
-use km003c_lib::PdCableIdentity;
-use km003c_lib::PdConnectionTracker;
-use km003c_lib::PdContract;
-use km003c_lib::PdContractStage;
-use km003c_lib::PdEvent;
-use km003c_lib::PdEventData;
-use km003c_lib::PdIdentity;
-use km003c_lib::PdLogCategory;
-use km003c_lib::PdLogEntry;
-use km003c_lib::PdLogger;
-use km003c_lib::PdRevision;
-use km003c_lib::PdStatus;
-use km003c_lib::Session;
-use km003c_lib::SessionEvent;
-use km003c_lib::pd_log::format_pdo;
-use km003c_lib::runtime::Instant;
-use km003c_lib::uom::si::electric_current::ampere;
-use km003c_lib::uom::si::electric_potential::volt;
-use km003c_lib::uom::si::frequency::hertz;
-use km003c_lib::uom::si::thermodynamic_temperature::degree_celsius;
-use km003c_lib::uom::si::time::second;
+use km003c_scope_core::DeviceState;
+use km003c_scope_core::GraphSampleRate;
+use km003c_scope_core::MeasurementAccumulator;
+use km003c_scope_core::MeasurementSample;
+use km003c_scope_core::Metric;
+use km003c_scope_core::PdCableIdentity;
+use km003c_scope_core::PdConnectionTracker;
+use km003c_scope_core::PdContract;
+use km003c_scope_core::PdContractStage;
+use km003c_scope_core::PdEvent;
+use km003c_scope_core::PdEventData;
+use km003c_scope_core::PdIdentity;
+use km003c_scope_core::PdLogCategory;
+use km003c_scope_core::PdLogEntry;
+use km003c_scope_core::PdLogger;
+use km003c_scope_core::PdRevision;
+use km003c_scope_core::PdStatus;
+use km003c_scope_core::Session;
+use km003c_scope_core::SessionEvent;
+use km003c_scope_core::pd_log::format_pdo;
+use km003c_scope_core::runtime::Instant;
+use km003c_scope_core::uom::si::electric_current::ampere;
+use km003c_scope_core::uom::si::electric_potential::volt;
+use km003c_scope_core::uom::si::frequency::hertz;
+use km003c_scope_core::uom::si::thermodynamic_temperature::degree_celsius;
+use km003c_scope_core::uom::si::time::second;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 #[cfg(not(target_arch = "wasm32"))]
@@ -2299,6 +2299,7 @@ fn current_flows_up(current: Option<f64>) -> Option<bool> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_meter_footer(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -2488,6 +2489,7 @@ impl MeterAverage {
     }
 
     /// Average the next half-second of samples. Returns the mean once the window is full.
+    #[allow(clippy::too_many_arguments)]
     fn push(
         &mut self,
         rate: GraphSampleRate,
@@ -2856,7 +2858,7 @@ impl PdView {
             match &event.data {
                 PdEventData::Connect => self.tracker.observe_event(true, now),
                 PdEventData::Disconnect => self.tracker.observe_event(false, now),
-                PdEventData::PdMessage { .. } => {}
+                PdEventData::PdMessage { .. } | PdEventData::DeviceStatus { .. } => {}
             }
             let entry = self.logger.log_event(event);
             log_pd_event(event, &entry);
@@ -2901,6 +2903,7 @@ fn log_pd_event(event: &PdEvent, entry: &PdLogEntry) {
             }
             format!(" | raw={hex}")
         }
+        PdEventData::DeviceStatus { code, raw } => format!(" | status={code:#04x} raw={raw:02x?}"),
         PdEventData::Connect | PdEventData::Disconnect => String::new(),
     };
     debug!("PD {}{details}{raw}", entry.summary());
@@ -3776,7 +3779,7 @@ async fn open_browser_device() -> Result<nusb::Device, String> {
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "No device selected. Click Connect to try again.".to_string())?;
-    km003c_lib::runtime::timeout(Duration::from_secs(10), async { info.open().await })
+    km003c_scope_core::runtime::timeout(Duration::from_secs(10), async { info.open().await })
         .await
         .map_err(|_| "Timed out opening the KM003C.".to_string())?
         .map_err(|error| error.to_string())
@@ -4017,12 +4020,12 @@ mod tests {
         timeline_shift_after_gap, trim_to_max_samples, usb_vendor_name, visible_sample_range, wall_gap_us,
         zoomed_pixels_per_second, zoomed_view_end_at_pointer,
     };
-    use km003c_lib::MeasurementSample;
-    use km003c_lib::Metric;
-    use km003c_lib::PdIdentity;
-    use km003c_lib::PdLogCategory;
-    use km003c_lib::PdLogEntry;
-    use km003c_lib::PdRevision;
+    use km003c_scope_core::MeasurementSample;
+    use km003c_scope_core::Metric;
+    use km003c_scope_core::PdIdentity;
+    use km003c_scope_core::PdLogCategory;
+    use km003c_scope_core::PdLogEntry;
+    use km003c_scope_core::PdRevision;
     use std::collections::VecDeque;
 
     #[test]

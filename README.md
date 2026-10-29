@@ -2,7 +2,7 @@
 
 <h1 align="center">km003c-rs</h1>
 
-<p align="center">Typed Rust library, CLI tools, GUI monitors, and Python bindings for the ChargerLAB POWER-Z KM003C USB-C power analyzer.</p>
+<p align="center">Typed Rust library, command-line interface, GUI monitors, and Python bindings for the ChargerLAB POWER-Z KM003C USB-C power analyzer.</p>
 
 <p align="center">
   <a href="https://crates.io/crates/km003c-lib"><img alt="crates.io" src="https://img.shields.io/crates/v/km003c-lib.svg"></a>
@@ -69,18 +69,32 @@ Core library providing:
   through the `polars` feature, with recovery of recordings a crash
   interrupted
 - Optional preferences shared by the GUIs through the `preferences` feature
+- Complete firmware maintenance with frontend-supplied backup storage and typed
+  progress; optional `firmware-catalog` for official releases with archive fallback
 
 ### `km003c-cli`
-Command-line tools:
-- `adc_simple` - Single-shot ADC readings with device info
-- `adc_queue_simple` - AdcQueue streaming demo
-- `test_usbpd` - USB PD negotiation capture
-- `offline-log` - List and export stored recordings as CSV or JSON
-- `firmware-update` - Verify and install an official KM003C firmware package
+One `km003c` executable with clap subcommands:
+- `info` - Device, firmware, and authentication information
+- `adc read` / `adc stream` - Single-shot measurements or AdcQueue streaming
+- `logs list` / `logs download` - Offline recording catalog and CSV/Parquet/JSON export
+- `pd capture` / `pd trace` - USB PD messages or internal firmware events
+- `debug memory read` / `debug memory scan` - Memory inspection for protocol research
+- `firmware list` / `firmware download` - Mirrored releases and release notes
+- `firmware inspect` / `firmware check` / `firmware update` - Package validation,
+  device checks and experimental firmware installation, including downgrades
+
+Connection flags (`--interface`, `--serial`, `--no-reset`, `--reset`) and
+`--verbose` are shared and can appear before or after subcommands. HID is
+supported only for `adc read`; other commands require the vendor interface.
+Diagnostic logs go to stderr, keeping `logs list --json` machine-readable.
+Firmware commands never reset USB implicitly and reject `--reset`.
+
+A separate `km003c-firmware-manual` executable verifies and installs local
+`.mencrypt` packages using this fork's manual updater implementation.
 
 ### `km003c-egui`
 
-Runs on desktop and in Chromium browsers via WebUSB. See [browser setup,
+Runs on desktop and in Chromium browsers via WebUSB and WebGPU. See [browser setup,
 constraints and hardware validation](km003c-egui/WEB.md).
 
 The [browser monitor](https://okhsunrog.github.io/km003c-rs/) is published from
@@ -89,15 +103,21 @@ the browser; no USB server or desktop application is needed. Use desktop Chrome
 or Edge and follow the [Linux setup](km003c-egui/WEB.md#linux-setup) if applicable.
 
 GUI application featuring:
-- Three independently configurable plots for live or device-stored measurements
+- Three independently configurable GPU plots for live or device-stored measurements
+- Shared wgpu core with Slint: line segments and compute min/max envelopes,
+  with incremental sample uploads and real timestamps
 - AdcQueue streaming with configurable sample rates
-- Adjustable time window (2s to 5min or all data)
+- Large live V/A/W readings and Charts / USB PD / Recordings / Firmware tabs
+- Shared X-only zoom/pan, timestamp cursor and stable stepped, fitted or manual Y scales
+- Adjustable time window (2s to 5min or all data), with a separate view pause
 - Live recording and plot-buffer export to Parquet or CSV
 - Device-stored offline recording catalog, download, plotting, and Parquet/CSV export
 - Host-integrated charge and energy with explicit missing-sample quality data
 - Combined wire-message and firmware-state USB PD timeline with source filters
-- Device info panel with auth status
-- Connect/disconnect control
+- Device settings with auth status and browser permission reuse after reload
+- Separate acquisition Start/Stop, file recording, view pause and USB Disconnect
+- Firmware upgrades, downgrades and reinstalls from the official server, archive or a local
+  `.mencrypt` package, with confirmation, verified backup and readback progress
 
 ### `km003c-slint` (experimental)
 A second GUI built with [Slint](https://slint.dev) that also runs on Android
@@ -161,14 +181,14 @@ and NixOS installation.
 
 ### Usage Examples
 
-#### Firmware Update
+#### Manual Firmware Update
 
 Download a KM003C `.mencrypt` file from [ChargerLAB's support page](https://www.power-z.com/blogs/technical-support/power-z-km003c-km002c-technical-support), then run:
 
 ```bash
-cargo run -p km003c-cli --bin firmware-update -- --verify-only /path/to/KM003C_V2.0.7.mencrypt
-cargo run -p km003c-cli --bin firmware-update -- --check /path/to/KM003C_V2.0.7.mencrypt
-cargo run -p km003c-cli --bin firmware-update -- /path/to/KM003C_V2.0.7.mencrypt
+cargo run -p km003c-firmware-manual -- --verify-only /path/to/KM003C_V2.0.7.mencrypt
+cargo run -p km003c-firmware-manual -- --check /path/to/KM003C_V2.0.7.mencrypt
+cargo run -p km003c-firmware-manual -- /path/to/KM003C_V2.0.7.mencrypt
 ```
 
 The command checks the package CRC, connected model and current version, asks
@@ -180,35 +200,128 @@ evidence and current validation status.
 #### ADC Reading
 
 ```bash
-cargo run --bin adc_simple
+cargo run --bin km003c -- info
+cargo run --bin km003c -- adc read
 ```
 
 #### AdcQueue Streaming
 
 ```bash
-cargo run --bin adc_queue_simple -- --rate 50 --duration 10
+cargo run --bin km003c -- adc stream --rate 50 --duration 10
 
-# Print every sample; current remains in amperes across the CLI tools.
-cargo run --bin adc_queue_simple -- --rate 1000 --duration 10 --every 1
+# Print every sample; current is displayed in amperes.
+cargo run --bin km003c -- adc stream --rate 1000 --duration 10 --every 1
 ```
 
 #### USB PD Capture
 
 ```bash
-cargo run --bin test_usbpd
+cargo run --bin km003c -- pd capture
+cargo run --bin km003c -- pd trace --polls 10
 ```
 
 #### Offline Recordings
 
 ```bash
-cargo run --bin offline-log -- metadata
-cargo run --bin offline-log -- download --index 0 --format csv
+cargo run --bin km003c -- logs list
+cargo run --bin km003c -- logs download --latest --output recording.csv
+cargo run --bin km003c -- logs download --index 0 --output recording.parquet
+cargo run --bin km003c -- logs download --latest --format json
 ```
+
+Choose exactly one of `--index` and `--latest`. The meter does not expose
+recording timestamps: `--latest` selects the highest numbered `A<number>.d`
+filename, and asks for `--index` if it encounters an unfamiliar naming scheme.
+The output format follows the `.csv`, `.parquet`, or `.json` extension;
+without an output path or explicit `--format`, it defaults to CSV.
+CSV and Parquet use the same 23-column recording schema as the GUIs. JSON
+contains the recording metadata and samples in the device's raw units.
+
+#### Command-line Installation and Help
+
+```bash
+cargo install --path km003c-cli --locked
+km003c --help
+km003c logs download --help
+km003c --no-reset logs download --latest --output recording.csv
+km003c debug memory read 0x420 --size 64
+```
+
+`km003c` replaces the former `adc_simple`, `adc_queue_simple`, `test_usbpd`,
+`offline-log`, `pd_trace`, and `memory_scan` executables. Update scripts to use
+the corresponding subcommands above. The library's `settings` and
+`calibration_auth` examples remain available through `cargo run --example`.
+
+#### Firmware
+
+```bash
+km003c firmware list
+# From DFU: download and install the latest release, without a local package.
+km003c firmware install --yes
+# Or select a version or build ID:
+km003c firmware install 2.0.7 --yes
+km003c firmware download 2.0.7 -o KM003C_V2.0.7.mencrypt
+km003c firmware inspect KM003C_V2.0.7.mencrypt
+km003c --serial 007965 firmware check KM003C_V2.0.7.mencrypt
+# Writes flash; requires an explicit backup path when the application is running:
+km003c --serial 007965 firmware update KM003C_V2.0.7.mencrypt --backup current-firmware.bin --yes
+```
+
+`list`, `download` and `inspect` do not access USB. The library tries the official
+catalog and objects first, then the public
+[km003c-resources archive](https://okhsunrog.github.io/km003c-resources/) if HTTP,
+catalog parsing or package validation fails. Fallback requires the same version,
+date, size and firmware CRC. Archive-selected packages also retain whole-file
+SHA-256 verification. The CLI reports the source and fallback reason.
+Bundled credentials remain encrypted in the library; no Windows EXE is required.
+Existing output files are never overwritten. If a version has multiple builds,
+pass the build ID printed by `firmware list` in place of the version argument.
+`install` downloads the package in memory and uses the same checks and update
+flow as `update`. It selects the release marked latest by the official catalog;
+when using the archive, it selects the highest numeric version and newest build
+date. Ambiguous latest builds must be selected by ID. As with `update`, include
+`--backup PATH` if installing from the stock application rather than DFU.
+
+Official Windows applications, manuals and source archives are kept as
+[km003c-resources Release assets](https://github.com/okhsunrog/km003c-resources/releases),
+including complete historical `orig_app` snapshots.
+
+`check` reads device identity without rebooting or writing flash. `update`
+backs up the current application using two matching reads and verifies its
+vectors, identity and CRC, then switches the same
+physical USB port into DFU, writes the package, then reboots and checks the
+complete application by reading it back. If already in DFU, application backup
+is unavailable and `--backup` is not required. A failed transfer leaves DFU
+available for a fresh update attempt; data blocks are never retried automatically.
+
+Older and same-version packages use the same update command. The inspected
+bootloader has no version-order check, so the client does not prohibit a
+downgrade. A release still needs to support the meter's hardware revision.
+The backup is the installed application, including its committed metadata;
+it is not a `.mencrypt` package or a complete device/calibration backup.
+
+Firmware installation is experimental. On hardware 2.1, the complete cycle
+`1.9.9 (2025.9.22) -> 2.0.7 -> original 1.9.9` passed full readback checks;
+the final application matched its original backup and the acquired bootloader
+region was unchanged. Interrupted-update recovery remains untested. See
+[firmware protocol and hardware validation notes](FIRMWARE.md).
 
 #### GUI Application
 
+On NixOS, enter the development shell first. It provides the Wayland, X11 and
+Vulkan libraries needed by the desktop GUI, including runtime library paths:
+
+```bash
+nix develop
+cargo run --release --bin km003c-egui
+```
+
+The Rust version comes from `rust-toolchain.toml` through rustup.
+The shell also selects a trusted CA bundle for OpenSSL/Python, preserving an
+existing `SSL_CERT_FILE` or Nix CA configuration. TLS verification stays enabled.
+
 Browser: open the [hosted monitor](https://okhsunrog.github.io/km003c-rs/) and
-click **Connect**, then select the KM003C and confirm the browser dialog. To run
+click **Start**, then select the KM003C and confirm the browser dialog. To run
 locally, install Trunk 0.21.14 and run `trunk serve --release` from the repository
 root. See [browser instructions](km003c-egui/WEB.md).
 
@@ -446,5 +559,9 @@ Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 
 ## Related Projects
 
+- **[km003c-resources](https://github.com/okhsunrog/km003c-resources)** - Archived firmware, official applications and manuals
 - **[km003c-protocol-research](https://github.com/okhsunrog/km003c-protocol-research)** - Protocol reverse engineering
 - **[usbpd](https://crates.io/crates/usbpd)** - Rust USB PD protocol library
+
+See [fork maintenance](docs/fork-maintenance.md) for the separation between
+upstream crates and local scope/manual-updater additions.

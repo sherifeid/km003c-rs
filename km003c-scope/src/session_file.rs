@@ -26,7 +26,7 @@ use std::io::Cursor;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
-use km003c_lib::MeasurementSample;
+use km003c_scope_core::MeasurementSample;
 
 const MAGIC: &[u8; 4] = b"KMSS";
 const VERSION: u16 = 1;

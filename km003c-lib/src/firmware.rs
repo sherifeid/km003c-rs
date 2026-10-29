@@ -1,16 +1,30 @@
-//! Reading and validating ChargerLAB `.mencrypt` firmware packages.
+//! ChargerLAB firmware packages and the KM003C bootloader update protocol.
+//!
+//! Package handling builds on the contribution in PR #60. The transfer and
+//! validation rules also follow successful USB captures and a bootloader dump.
+
+#[cfg(feature = "firmware-catalog")]
+pub mod catalog;
+mod install;
+pub use install::{
+    FirmwareBackup, FirmwareDeviceCheck, FirmwareInstallProgress, FirmwareInstallResult, FirmwareInstallStage,
+    InstalledFirmwareInfo, PreparedFirmwareUpdate, check_firmware_device,
+};
 
 use crate::auth::{MEMORY_READ_KEY, aes_ecb_decrypt_blocks};
 use crate::device::{DeviceSelector, KM003C, PID, VID};
 use crate::error::KMError;
+use crate::packet::{CtrlHeader, PacketPeek, PacketType};
 use std::num::NonZeroU8;
 use std::time::Duration;
 
 const FIELD_COUNT: usize = 10;
 const MAX_FIELD_BYTES: usize = 64 * 1024;
-const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum application size accepted by the inspected KM003C bootloader.
+pub const MAX_IMAGE_BYTES: usize = 0x6fffe;
 const WRITE_CHUNK_SIZE: usize = 0xFF0;
 const APPLICATION_BASE: u32 = 0x4000;
+const IMAGE_METADATA_OFFSET: usize = 0x428;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FirmwareUsbMode {
@@ -127,11 +141,12 @@ pub struct FirmwareMetadata {
 
 #[derive(Debug, Clone)]
 pub struct FirmwareImage {
-    pub metadata: FirmwareMetadata,
-    /// Decrypted firmware bytes. The package's extra AES block is excluded.
-    pub data: Vec<u8>,
+    metadata: FirmwareMetadata,
+    /// Decrypted firmware, excluding AES alignment padding.
+    data: Vec<u8>,
     /// Original encrypted payload sent to the device during an update.
-    pub encrypted_data: Vec<u8>,
+    encrypted_data: Vec<u8>,
+    trailer: Vec<u8>,
 }
 
 impl FirmwareImage {
@@ -177,15 +192,17 @@ impl FirmwareImage {
             return Err(invalid("firmware size is outside supported limits"));
         }
         let encrypted_len = input.u32()? as usize;
-        if encrypted_len != input.bytes.len() - input.offset
-            || !encrypted_len.is_multiple_of(16)
-            || encrypted_len < size
-            || encrypted_len > size.saturating_add(31)
-        {
+        if !encrypted_len.is_multiple_of(16) || encrypted_len < size || encrypted_len > size.saturating_add(31) {
             return Err(invalid("firmware ciphertext length does not match metadata"));
         }
         let encrypted = input.take(encrypted_len)?;
-        let mut data = aes_ecb_decrypt_blocks(encrypted, MEMORY_READ_KEY)?;
+        // QDataStream reads one QByteArray, not the rest of the file. The
+        // independently verified 1.9.9 package has four outer trailer bytes.
+        let trailer = input.take(input.bytes.len() - input.offset)?;
+        if trailer.len() > MAX_FIELD_BYTES {
+            return Err(invalid("firmware package trailer exceeds supported limits"));
+        }
+        let mut data = aes_ecb_decrypt_blocks(encrypted, &MEMORY_READ_KEY)?;
         data.truncate(size);
         let actual_crc = crc32fast::hash(&data);
         if actual_crc != crc32 {
@@ -206,14 +223,39 @@ impl FirmwareImage {
             },
             data,
             encrypted_data: encrypted.to_vec(),
+            trailer: trailer.to_vec(),
         })
     }
 
-    fn validate_for_update(&self) -> Result<(), KMError> {
+    /// Validated metadata. Images are immutable after parsing.
+    pub fn metadata(&self) -> &FirmwareMetadata {
+        &self.metadata
+    }
+
+    /// Original plaintext bytes, before the bootloader commits size and CRC.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Original ciphertext; outer container trailer bytes are excluded.
+    pub fn encrypted_data(&self) -> &[u8] {
+        &self.encrypted_data
+    }
+
+    /// Container bytes after the encrypted QByteArray. Never uploaded.
+    pub fn trailer(&self) -> &[u8] {
+        &self.trailer
+    }
+
+    /// Check target, vectors, embedded metadata, application bounds and text.
+    /// No version ordering is imposed: the inspected bootloader permits both
+    /// upgrades and downgrades. Compatibility of a particular release with the
+    /// attached hardware must still be established by its publisher.
+    pub fn validate_for_update(&self) -> Result<(), KMError> {
         if self.metadata.model != "KM003C" {
             return Err(invalid(format!("firmware model {} is not KM003C", self.metadata.model)));
         }
-        if self.metadata.size == 0 || self.metadata.size > MAX_IMAGE_BYTES {
+        if self.metadata.size < 0x460 || self.metadata.size > MAX_IMAGE_BYTES {
             return Err(invalid("firmware size is outside supported limits"));
         }
         if self.data.len() != self.metadata.size || crc32fast::hash(&self.data) != self.metadata.crc32 {
@@ -222,7 +264,7 @@ impl FirmwareImage {
         if self.encrypted_data.len() < self.data.len()
             || self.encrypted_data.len() > self.data.len().saturating_add(31)
             || !self.encrypted_data.len().is_multiple_of(16)
-            || aes_ecb_decrypt_blocks(&self.encrypted_data, MEMORY_READ_KEY)?[..self.data.len()] != self.data
+            || aes_ecb_decrypt_blocks(&self.encrypted_data, &MEMORY_READ_KEY)?[..self.data.len()] != self.data
         {
             return Err(invalid("encrypted firmware no longer matches the validated image"));
         }
@@ -231,16 +273,34 @@ impl FirmwareImage {
             (&self.metadata.version, 12, "version"),
             (&self.metadata.date, 12, "date"),
         ] {
-            if !value.is_ascii() || value.len() >= capacity {
+            if value.is_empty() || !value.is_ascii() || value.contains('\0') || value.len() >= capacity {
                 return Err(invalid(format!(
                     "firmware {name} must be ASCII and fit in {capacity} bytes"
                 )));
             }
         }
+        let word = |offset| u32::from_le_bytes(self.data[offset..offset + 4].try_into().expect("validated size"));
+        validate_application_vectors(&self.data)?;
+        if word(0x420) != APPLICATION_BASE || self.data[IMAGE_METADATA_OFFSET..IMAGE_METADATA_OFFSET + 8] != [0xff; 8] {
+            return Err(invalid("firmware application base or uncommitted metadata is invalid"));
+        }
+        for (offset, expected) in [
+            (0x430, &self.metadata.model),
+            (0x43c, &self.metadata.version),
+            (0x448, &self.metadata.date),
+        ] {
+            let actual = &self.data[offset..offset + 12];
+            let end = actual.iter().position(|b| *b == 0).unwrap_or(actual.len());
+            if &actual[..end] != expected.as_bytes() {
+                return Err(invalid(
+                    "package metadata does not match the embedded firmware identity",
+                ));
+            }
+        }
         Ok(())
     }
 
-    fn setup_packet(&self, id: u8) -> Result<[u8; 68], KMError> {
+    fn setup_packet(&self, id: u8, random: u32) -> Result<[u8; 68], KMError> {
         self.validate_for_update()?;
         let mut packet = [0_u8; 68];
         packet[..4].copy_from_slice(&[0x42, id, 0, 4]);
@@ -255,121 +315,233 @@ impl FirmwareImage {
         packet[20..20 + self.metadata.model.len()].copy_from_slice(self.metadata.model.as_bytes());
         packet[32..32 + self.metadata.version.len()].copy_from_slice(self.metadata.version.as_bytes());
         packet[44..44 + self.metadata.date.len()].copy_from_slice(self.metadata.date.as_bytes());
-        packet[56..60].copy_from_slice(&rand::random::<u32>().to_le_bytes());
+        packet[56..60].copy_from_slice(&random.to_le_bytes());
         Ok(packet)
+    }
+
+    /// Expected installed bytes, including the bootloader's final metadata patch.
+    pub fn installed_data(&self) -> Result<Vec<u8>, KMError> {
+        self.validate_for_update()?;
+        let mut installed = self.data.clone();
+        installed[IMAGE_METADATA_OFFSET..IMAGE_METADATA_OFFSET + 4]
+            .copy_from_slice(&(self.metadata.size as u32).to_le_bytes());
+        installed[IMAGE_METADATA_OFFSET + 4..IMAGE_METADATA_OFFSET + 8]
+            .copy_from_slice(&self.metadata.crc32.to_le_bytes());
+        Ok(installed)
+    }
+}
+
+fn validate_application_vectors(data: &[u8]) -> Result<(), KMError> {
+    if !(8..=MAX_IMAGE_BYTES).contains(&data.len()) {
+        return Err(invalid("firmware contains invalid application vectors"));
+    }
+    let word = |offset| u32::from_le_bytes(data[offset..offset + 4].try_into().expect("validated vector length"));
+    let sp = word(0);
+    let reset = word(4);
+    let end = APPLICATION_BASE + data.len() as u32;
+    if sp <= 0x1fff8000
+        || sp >= 0x20020000
+        || !sp.is_multiple_of(4)
+        || reset & 1 == 0
+        || (reset & !1) < APPLICATION_BASE
+        || (reset & !1) >= end
+    {
+        return Err(invalid("firmware contains invalid application vectors"));
+    }
+    Ok(())
+}
+
+trait FirmwareTransport {
+    fn next_id(&mut self) -> u8;
+    async fn write(&mut self, bytes: &[u8]) -> Result<(), KMError>;
+    async fn read(&mut self, timeout: Duration) -> Result<Vec<u8>, KMError>;
+}
+
+impl FirmwareTransport for KM003C {
+    fn next_id(&mut self) -> u8 {
+        self.next_tid()
+    }
+
+    async fn write(&mut self, bytes: &[u8]) -> Result<(), KMError> {
+        // send_raw flushes the logical transfer, including a ZLP at 64-byte
+        // multiples. Ciphertext blocks do not receive a protocol header.
+        self.send_raw(bytes).await
+    }
+
+    async fn read(&mut self, duration: Duration) -> Result<Vec<u8>, KMError> {
+        self.read_raw_with_timeout(duration).await
     }
 }
 
 impl KM003C {
-    /// Ask the running application to reboot into its DFU bootloader.
-    /// The USB handle will become invalid after this command.
+    /// Read model and hardware identity from a DFU maintenance connection.
+    /// Bootloader response IDs are independent of the request IDs.
+    pub async fn get_bootloader_info(&mut self) -> Result<crate::auth::DeviceInfo, KMError> {
+        if !self.firmware_transport_available() {
+            return Err(invalid("bootloader checks require a vendor maintenance connection"));
+        }
+        bootloader_info(self).await
+    }
+
+    /// Reboot the application into DFU. Drop this handle before reopening USB.
     pub async fn jump_to_dfu(&mut self) -> Result<(), KMError> {
         let id = self.next_tid();
         self.send_raw(&[0x09, id, 0, 0]).await
     }
 
-    /// Ask the DFU bootloader to start the application.
-    /// The USB handle will become invalid after this command.
+    /// Start the application from DFU. Drop this handle before reopening USB.
     pub async fn jump_to_application(&mut self) -> Result<(), KMError> {
         let id = self.next_tid();
         self.send_raw(&[0x08, id, 0, 0]).await
     }
 
-    /// Write a validated official firmware image through the vendor interface.
+    /// Erase and write a validated image, which may have an older version.
     ///
-    /// The caller must already have confirmed that the connected KM003C is in
-    /// DFU mode. Progress counts encrypted bytes accepted by the bootloader.
-    pub async fn update_firmware<F>(&mut self, image: &FirmwareImage, mut progress: F) -> Result<(), KMError>
+    /// Open a fresh vendor maintenance connection and establish DFU mode with
+    /// [`find_firmware_device`] first. No data block is retried on failure:
+    /// the bootloader has no sequence numbers and may already have advanced
+    /// its write cursor. On failure, leave the device in DFU for recovery.
+    /// `Complete` means the bootloader reported success; separately reboot and
+    /// verify the installed bytes with [`FirmwareImage::installed_data`].
+    pub async fn update_firmware<F>(&mut self, image: &FirmwareImage, progress: F) -> Result<(), KMError>
     where
         F: FnMut(FirmwareUpdateProgress),
     {
-        image.validate_for_update()?;
-        let total_bytes = image.encrypted_data.len();
-        let mut report = |stage, bytes_written| {
-            progress(FirmwareUpdateProgress {
-                stage,
-                bytes_written,
-                total_bytes,
-            });
-        };
-
-        report(FirmwareUpdateStage::Connecting, 0);
-        let id = self.next_tid();
-        self.send_raw(&[0x02, id, 0, 0]).await?;
-        expect_type(&self.receive_raw().await?, 0x05, "DFU connect")?;
-
-        report(FirmwareUpdateStage::CheckingStatus, 0);
-        let mut status_request = [0_u8; 20];
-        status_request[..4].copy_from_slice(&[0x40, self.next_tid(), 0, 1]);
-        self.send_raw(&status_request).await?;
-        let status = self.receive_raw().await?;
-        let status_code = parse_dfu_status(&status)?;
-        if status_code != 0 {
-            return Err(KMError::Protocol(format!("DFU reports status 0x{status_code:08X}")));
-        }
-
-        report(FirmwareUpdateStage::Erasing, 0);
-        let id = self.next_tid();
-        self.send_raw(&image.setup_packet(id)?).await?;
-        // Mtools initially waits 20 ms, then polls while the bootloader erases.
-        // A bounded longer wait avoids treating an ordinary erase delay as failure.
-        let mut erased = false;
-        for _ in 0..10 {
-            match self.receive_raw().await {
-                Ok(response) => {
-                    expect_type(&response, 0x05, "firmware erase")?;
-                    erased = true;
-                    break;
-                }
-                Err(KMError::Timeout(_)) => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        if !erased {
-            return Err(KMError::Protocol(
-                "timed out waiting for firmware erase acknowledgment".into(),
+        if !self.firmware_transport_available() {
+            return Err(invalid(
+                "firmware updates require a fresh vendor maintenance connection",
             ));
         }
-
-        report(FirmwareUpdateStage::Writing, 0);
-        let mut written = 0;
-        for chunk in image.encrypted_data.chunks(WRITE_CHUNK_SIZE) {
-            self.send_raw(chunk).await?;
-            expect_type(&self.receive_raw().await?, 0x01, "firmware chunk")?;
-            written += chunk.len();
-            report(FirmwareUpdateStage::Writing, written);
+        image.validate_for_update()?;
+        let identity = self.get_bootloader_info().await?;
+        if identity.model != image.metadata.model {
+            return Err(invalid("bootloader model does not match firmware package"));
         }
-
-        report(FirmwareUpdateStage::Verifying, written);
-        expect_type(&self.receive_raw().await?, 0x07, "firmware verification")?;
-        report(FirmwareUpdateStage::Complete, written);
-        Ok(())
+        transfer_image(self, image, rand::random(), progress).await
     }
 }
 
-fn expect_type(response: &[u8], expected: u8, step: &str) -> Result<(), KMError> {
-    let Some(&first) = response.first() else {
-        return Err(KMError::Protocol(format!("empty {step} response")));
+async fn bootloader_info(transport: &mut impl FirmwareTransport) -> Result<crate::auth::DeviceInfo, KMError> {
+    let duration = Duration::from_secs(2);
+    let id = transport.next_id();
+    transport.write(&[2, id, 0, 0]).await?;
+    expect_type(
+        &transport.read(duration).await?,
+        PacketType::Accept,
+        "bootloader identity connect",
+    )?;
+    let request = crate::auth::build_memory_read_packet(0x420, 64, transport.next_id());
+    transport.write(&request).await?;
+    let confirmation = transport.read(duration).await?;
+    expect_type(&confirmation, PacketType::MemoryRead, "bootloader identity")?;
+    if confirmation.len() != 20 || crate::auth::parse_memory_read_confirmation(&confirmation[4..]) != Some((0x420, 64))
+    {
+        return Err(invalid("invalid bootloader identity memory confirmation"));
+    }
+    let ciphertext = transport.read(duration).await?;
+    if ciphertext.len() != 64 {
+        return Err(invalid("invalid bootloader identity data length"));
+    }
+    let data = aes_ecb_decrypt_blocks(&ciphertext, &MEMORY_READ_KEY)?;
+    let mut info = crate::auth::DeviceInfo::default();
+    info.parse_device_info(&data);
+    if info.model.is_empty() || info.hw_version.is_empty() {
+        return Err(invalid("bootloader identity is missing model or hardware version"));
+    }
+    Ok(info)
+}
+
+async fn transfer_image(
+    transport: &mut impl FirmwareTransport,
+    image: &FirmwareImage,
+    random: u32,
+    mut progress: impl FnMut(FirmwareUpdateProgress),
+) -> Result<(), KMError> {
+    image.validate_for_update()?;
+    let total_bytes = image.encrypted_data.len();
+    let mut report = |stage, bytes_written| {
+        progress(FirmwareUpdateProgress {
+            stage,
+            bytes_written,
+            total_bytes,
+        })
     };
-    let actual = first & 0x7f;
-    if actual != expected {
+    let ack_timeout = Duration::from_secs(2);
+    report(FirmwareUpdateStage::Connecting, 0);
+    let id = transport.next_id();
+    transport.write(&[0x02, id, 0, 0]).await?;
+    expect_type(&transport.read(ack_timeout).await?, PacketType::Accept, "DFU connect")?;
+
+    report(FirmwareUpdateStage::CheckingStatus, 0);
+    let mut head = [0; 20];
+    head[..4].copy_from_slice(&[0x40, transport.next_id(), 0, 1]);
+    transport.write(&head).await?;
+    let reply = transport.read(ack_timeout).await?;
+    expect_type(&reply, PacketType::Head, "DFU header")?;
+    if reply.len() != 20 || reply[4..8] != [0; 4] {
+        return Err(invalid("unexpected DFU header body"));
+    }
+
+    report(FirmwareUpdateStage::Erasing, 0);
+    let setup = image.setup_packet(transport.next_id(), random)?;
+    transport.write(&setup).await?;
+    // One receive with an erase-specific deadline accepts both immediate and
+    // delayed Accept. It never resends Setup or cancels/restarts partial reads.
+    expect_type(
+        &transport.read(Duration::from_secs(20)).await?,
+        PacketType::Accept,
+        "firmware erase",
+    )?;
+
+    report(FirmwareUpdateStage::Writing, 0);
+    let mut written = 0;
+    for chunk in image.encrypted_data.chunks(WRITE_CHUNK_SIZE) {
+        transport.write(chunk).await?;
+        expect_type(&transport.read(ack_timeout).await?, PacketType::Sync, "firmware block")?;
+        written += chunk.len();
+        report(FirmwareUpdateStage::Writing, written);
+    }
+    report(FirmwareUpdateStage::Verifying, written);
+    expect_type(
+        &transport.read(Duration::from_secs(5)).await?,
+        PacketType::Finished,
+        "firmware checksum",
+    )?;
+    report(FirmwareUpdateStage::Complete, written);
+    Ok(())
+}
+
+fn expect_type(response: &[u8], expected: PacketType, step: &str) -> Result<(), KMError> {
+    let peek = PacketPeek::from_bytes(response).ok_or_else(|| invalid(format!("truncated {step} response")))?;
+    if matches!(
+        peek.packet_type,
+        PacketType::Rejected | PacketType::Error | PacketType::NotReadable
+    ) {
+        let header = CtrlHeader::from_bytes(response[..4].try_into().expect("checked header"));
         return Err(KMError::Protocol(format!(
-            "{step} response type 0x{actual:02X}, expected 0x{expected:02X}"
+            "{step}: bootloader {:?}, code {} (attribute 0x{:04X})",
+            peek.packet_type,
+            header.attribute() >> 5,
+            header.attribute()
+        )));
+    }
+    if peek.packet_type != expected {
+        return Err(KMError::Protocol(format!(
+            "{step}: expected {expected:?}, received {:?}",
+            peek.packet_type
+        )));
+    }
+    if expected.is_ctrl_type() && response.len() != 4 {
+        return Err(invalid(format!(
+            "invalid {step} control response length {}",
+            response.len()
         )));
     }
     Ok(())
 }
 
-fn parse_dfu_status(response: &[u8]) -> Result<u32, KMError> {
-    expect_type(response, 0x40, "DFU status")?;
-    // Mtools accepts any status response longer than 7 bytes and reads the
-    // 32-bit bootloader status at offset 4. A KM003C normally returns the
-    // 4-byte header plus a 16-byte body (20 bytes total).
-    if response.len() < 8 {
-        return Err(invalid(format!("DFU status response is only {} bytes", response.len())));
-    }
-    Ok(u32::from_le_bytes(response[4..8].try_into().expect("four bytes")))
-}
+#[cfg(test)]
+mod tests;
 
 fn invalid(message: impl Into<String>) -> KMError {
     KMError::InvalidPacket(message.into())
@@ -397,81 +569,5 @@ impl<'a> Input<'a> {
     fn u32(&mut self) -> Result<u32, KMError> {
         let bytes: [u8; 4] = self.take(4)?.try_into().expect("four bytes");
         Ok(u32::from_be_bytes(bytes))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use aes::Aes128;
-    use aes::cipher::{BlockCipherEncrypt, KeyInit};
-
-    fn package() -> Vec<u8> {
-        let plaintext = [*b"0123456789ABCDEF", *b"0123456789ABCDEF"].concat();
-        let fields = [
-            "Firmware file".to_owned(),
-            "ChargerLab".to_owned(),
-            "V1.0".to_owned(),
-            "KM003C".to_owned(),
-            "2.0.7".to_owned(),
-            "2026.9.29".to_owned(),
-            format!("{:08X}", crc32fast::hash(&plaintext[..16])),
-            "16".to_owned(),
-            "notes".to_owned(),
-            "notes".to_owned(),
-        ];
-        let mut bytes = (fields.len() as u32).to_be_bytes().to_vec();
-        for field in fields {
-            let encoded: Vec<u8> = field.encode_utf16().flat_map(u16::to_be_bytes).collect();
-            bytes.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-            bytes.extend_from_slice(&encoded);
-        }
-        let cipher = Aes128::new(MEMORY_READ_KEY.into());
-        let mut encrypted = plaintext;
-        for block in encrypted.as_chunks_mut::<16>().0 {
-            cipher.encrypt_block(block.into());
-        }
-        bytes.extend_from_slice(&(encrypted.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(&encrypted);
-        bytes
-    }
-
-    #[test]
-    fn parses_package_and_builds_setup_record() {
-        let image = FirmwareImage::parse(&package()).unwrap();
-        assert_eq!(image.metadata.model, "KM003C");
-        assert_eq!(image.data, b"0123456789ABCDEF");
-        let packet = image.setup_packet(7).unwrap();
-        assert_eq!(&packet[..4], &[0x42, 7, 0, 4]);
-        assert_eq!(u32::from_le_bytes(packet[4..8].try_into().unwrap()), 0x4000);
-        assert_eq!(u32::from_le_bytes(packet[8..12].try_into().unwrap()), 0x4010);
-        assert_eq!(u32::from_le_bytes(packet[12..16].try_into().unwrap()), 16);
-        assert_eq!(&packet[20..26], b"KM003C");
-        assert_eq!(&packet[32..37], b"2.0.7");
-        assert_eq!(&packet[44..53], b"2026.9.29");
-    }
-
-    #[test]
-    fn rejects_corrupted_ciphertext() {
-        let mut bytes = package();
-        let image_start = bytes.len() - 32;
-        bytes[image_start] ^= 1;
-        assert!(FirmwareImage::parse(&bytes).is_err());
-    }
-
-    #[test]
-    fn handles_padded_usb_mode_descriptor() {
-        assert_eq!(
-            parse_mode_string("APP\0\u{ffff}"),
-            ("APP".into(), FirmwareUsbMode::Application)
-        );
-        assert_eq!(parse_mode_string("DFU\0\u{ffff}"), ("DFU".into(), FirmwareUsbMode::Dfu));
-    }
-
-    #[test]
-    fn accepts_twenty_byte_dfu_status_response() {
-        let mut response = [0_u8; 20];
-        response[..4].copy_from_slice(&[0x40, 1, 0, 1]);
-        assert_eq!(parse_dfu_status(&response).unwrap(), 0);
     }
 }

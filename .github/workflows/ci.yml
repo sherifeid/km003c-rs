@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Linux build dependencies
-        run: sudo apt-get update && sudo apt-get install --yes libwayland-dev libxkbcommon-dev
+        run: sudo apt-get update && sudo apt-get install --yes libwayland-dev libxkbcommon-dev mesa-vulkan-drivers
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -30,6 +30,12 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace --all-targets --locked
       - run: cargo test --workspace --all-targets --all-features --locked
+      - name: Test shared GPU renderer and egui texture integration
+        env:
+          WGPU_BACKEND: vulkan
+        run: |
+          cargo test -p realtime-plot --locked -- --ignored
+          cargo test -p km003c-egui gpu_plot::tests::gpu_cache --locked -- --ignored
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo doc --workspace --all-features --no-deps --locked
@@ -97,6 +103,13 @@ jobs:
           key: wasm-egui
       - run: cargo check -p km003c-egui --target wasm32-unknown-unknown --locked
       - run: cargo check -p km003c-scope --target wasm32-unknown-unknown --locked
+      - name: Install the browser test runner matching Cargo.lock
+        run: cargo install wasm-bindgen-cli --version "$(cargo pkgid --package wasm-bindgen --locked | sed 's/.*@//')" --locked
+      - name: Test browser recording and navigation protection
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+          CHROMEDRIVER: /usr/local/share/chromedriver-linux64/chromedriver
+        run: cargo test -p km003c-lib --target wasm32-unknown-unknown --features browser --test browser_recording --locked
       - run: cargo install trunk --version 0.21.14 --locked
       - run: trunk build --release
       - name: Build the scope page

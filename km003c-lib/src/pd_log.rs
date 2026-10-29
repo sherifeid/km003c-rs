@@ -20,10 +20,8 @@ use usbpd::protocol_layer::message::header::{
 use usbpd::units::{ElectricCurrent, ElectricPotential, Power};
 
 use crate::pd::PdEvent;
-use crate::pd_cable::PdCableIdentity;
 use crate::pd_decode::{
-    DecodedPdEvent, DecodedPdMessage, PdChunkState, PdChunkStatus, PdDecodeFailure, PdIdentity, PdRevision,
-    PdSessionDecoder,
+    DecodedPdEvent, DecodedPdMessage, PdChunkState, PdChunkStatus, PdDecodeFailure, PdSessionDecoder,
 };
 
 // usbpd stores quantities as `u32` in milliamperes, millivolts and
@@ -67,6 +65,7 @@ pub enum PdLogCategory {
     Control,
     Extended,
     Error,
+    Diagnostic,
 }
 
 /// One PD event described for display.
@@ -124,44 +123,21 @@ impl PdLogger {
         self.session.source_capabilities()
     }
 
-    /// Most recently observed source USB PD revision on SOP traffic.
-    pub const fn revision(&self) -> Option<PdRevision> {
-        self.session.revision()
-    }
-
-    /// Most recently observed SOP Discover Identity acknowledgement.
-    pub const fn identity(&self) -> Option<PdIdentity> {
-        self.session.identity()
-    }
-
-    /// Whether the captured host attempted cable Discover Identity.
-    pub fn cable_discovery_requested(&self) -> bool {
-        self.session.cable_discovery_requested()
-    }
-
-    /// Most recently observed cable identities, keyed by their raw SOP selectors.
-    pub fn cable_identities(&self) -> &[PdCableIdentity] {
-        self.session.cable_identities()
-    }
-
-    /// Number of most recently advertised SPR source PDOs.
-    pub fn source_pdo_count(&self) -> Option<usize> {
-        self.source_capabilities().map(|capabilities| capabilities.pdos().len())
-    }
-
-    /// Maximum power advertised by any retained SPR source PDO.
-    pub fn source_max_power_w(&self) -> Option<f64> {
-        self.source_capabilities()?
-            .pdos()
-            .iter()
-            .filter_map(pdo_max_power_w)
-            .reduce(f64::max)
-    }
-
     pub fn log_event(&mut self, event: &PdEvent) -> PdLogEntry {
         match self.session.decode_event(event) {
             DecodedPdEvent::Connect { timestamp } => connection_entry(timestamp.get::<second>(), true),
             DecodedPdEvent::Disconnect { timestamp } => connection_entry(timestamp.get::<second>(), false),
+            DecodedPdEvent::DeviceStatus { timestamp, code, raw } => PdLogEntry {
+                timestamp_seconds: timestamp.get::<second>(),
+                category: PdLogCategory::Diagnostic,
+                sop: None,
+                title: format!("Device status 0x{code:02X}"),
+                header: None,
+                details: vec![
+                    format!("Flags: {:02X}", raw.get(4).copied().unwrap_or(0)),
+                    format!("Raw: {raw:02X?}"),
+                ],
+            },
             DecodedPdEvent::Message(message) => self.message_entry(&message),
             DecodedPdEvent::Chunk(status) => chunk_entry(status),
             DecodedPdEvent::Error(failure) => failure_entry(failure),
@@ -225,16 +201,8 @@ fn connection_entry(timestamp_seconds: f64, connected: bool) -> PdLogEntry {
 }
 
 fn format_header(header: &Header) -> String {
-    let revision = header
-        .spec_revision()
-        .map(|revision| match revision {
-            usbpd::protocol_layer::message::header::SpecificationRevision::R1_0 => "PD1.0",
-            usbpd::protocol_layer::message::header::SpecificationRevision::R2_0 => "PD2.0",
-            usbpd::protocol_layer::message::header::SpecificationRevision::R3_X => "PD3.x",
-        })
-        .unwrap_or("reserved revision");
     format!(
-        "ID={}, {revision}, {:?}/{:?}",
+        "ID={}, {:?}/{:?}",
         header.message_id(),
         header.port_power_role(),
         header.port_data_role()
@@ -507,20 +475,6 @@ pub fn format_pdo(pdo: &PowerDataObject) -> String {
     }
 }
 
-/// Maximum power represented by one source PDO, in watts.
-pub fn pdo_max_power_w(pdo: &PowerDataObject) -> Option<f64> {
-    match pdo {
-        PowerDataObject::FixedSupply(fixed) => Some(fixed.voltage().volts() * fixed.max_current().amps()),
-        PowerDataObject::Battery(battery) => Some(battery.max_power().watts()),
-        PowerDataObject::VariableSupply(variable) => {
-            Some(variable.max_voltage().volts() * variable.max_current().amps())
-        }
-        PowerDataObject::Augmented(Augmented::Spr(pps)) => Some(pps.max_voltage().volts() * pps.max_current().amps()),
-        PowerDataObject::Augmented(Augmented::Epr(avs)) => Some(avs.pd_power().watts()),
-        PowerDataObject::Augmented(Augmented::Unknown(_)) | PowerDataObject::Unknown(_) => None,
-    }
-}
-
 fn format_capabilities(capabilities: &[PowerDataObject], title: &str) -> Vec<String> {
     let mut lines = vec![format!("[{title}]")];
     for (index, pdo) in capabilities.iter().enumerate() {
@@ -556,8 +510,7 @@ mod tests {
 
     #[test]
     fn source_capabilities_list_their_pdos() {
-        let mut logger = PdLogger::new();
-        let entry = logger.log_event(&message(1_500.0, SOURCE_CAPS));
+        let entry = PdLogger::new().log_event(&message(1_500.0, SOURCE_CAPS));
 
         assert_eq!(entry.category, PdLogCategory::SourceCaps);
         assert_eq!(entry.title, "Source_Capabilities");
@@ -568,9 +521,6 @@ mod tests {
         // Fractional volts survive: usbpd's u32 storage used to cut 3.3 V to 3.
         assert!(entry.details[6].starts_with("PDO[6]: PPS 3.3-"), "{}", entry.details[6]);
         assert!(entry.summary().starts_with("[1.500s] SOP0: Source_Capabilities (ID="));
-        assert!(entry.summary().contains("PD3.x, Source/Dfp"));
-        assert_eq!(logger.source_pdo_count(), Some(6));
-        assert!(logger.source_max_power_w().is_some_and(|watts| watts >= 65.0));
     }
 
     #[test]
@@ -600,9 +550,37 @@ mod tests {
     }
 
     #[test]
+    fn unknown_device_status_is_diagnostic_and_preserves_decoder_context() {
+        let raw = [0x45, 0x34, 0x12, 0, 0x80, 0x02];
+        let mut bytes = vec![0; crate::constants::PD_STATUS_SIZE];
+        bytes.extend(raw);
+        let stream = crate::pd::PdEventStream::from_bytes(bytes.into()).unwrap();
+        assert!(matches!(&stream.events[0].data, PdEventData::DeviceStatus { code: 2, raw: saved } if saved == &raw));
+        assert_eq!(stream.events[0].timestamp.get::<millisecond>(), 4660.0);
+        let mut logger = PdLogger::new();
+        logger.log_event(&message(0.0, SOURCE_CAPS));
+        let entry = logger.log_event(&stream.events[0]);
+        assert_eq!(entry.category, PdLogCategory::Diagnostic);
+        assert!(entry.details[1].contains("45, 34, 12, 00, 80, 02"));
+        let request = logger.log_event(&message(5_000.0, REQUEST));
+        assert!(request.details[0].contains("Fixed 9V"));
+        assert_eq!(logger.log_event(&message(6_000.0, "")).category, PdLogCategory::Error);
+        for (code, category) in [
+            (0x21, PdLogCategory::Connect),
+            (0x11, PdLogCategory::Connect),
+            (0x22, PdLogCategory::Disconnect),
+            (0x12, PdLogCategory::Disconnect),
+        ] {
+            let mut bytes = vec![0; crate::constants::PD_STATUS_SIZE];
+            bytes.extend([0x45, 0, 0, 0, 0, code]);
+            let stream = crate::pd::PdEventStream::from_bytes(bytes.into()).unwrap();
+            assert_eq!(logger.log_event(&stream.events[0]).category, category);
+        }
+    }
+
+    #[test]
     fn good_crc_is_recognised() {
         let entry = PdLogger::new().log_event(&message(0.0, "4102"));
         assert!(entry.is_good_crc());
-        assert!(entry.summary().contains("PD2.0, Sink/Ufp"));
     }
 }

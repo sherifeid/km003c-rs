@@ -13,7 +13,7 @@ use km003c_lib::usbpd::protocol_layer::message::data::request::PowerSource;
 #[cfg(feature = "usbpd")]
 use km003c_lib::usbpd::protocol_layer::message::extended::Extended;
 #[cfg(feature = "usbpd")]
-use km003c_lib::{DecodedPdEvent, PdChunkState, PdEvent, PdIdentity, PdRevision, PdSessionDecoder};
+use km003c_lib::{DecodedPdEvent, PdChunkState, PdEvent, PdSessionDecoder};
 
 fn parse_pd_events(frame: &str) -> km003c_lib::PdEventStream {
     let raw = RawPacket::try_from(Bytes::from(hex::decode(frame).unwrap())).unwrap();
@@ -147,23 +147,6 @@ fn semantically_decodes_recorded_pd_negotiation_with_source_state() {
         Some(Payload::Data(Data::SourceCapabilities(_)))
     ));
     assert!(decoder.source_capabilities().is_some());
-    assert_eq!(decoder.revision(), Some(PdRevision::Revision3));
-
-    // The following PD2.0 GoodCRC is sent by the sink and must not downgrade
-    // the source revision shown in the summary.
-    decoder.decode_event(&stream.events[1]);
-    assert_eq!(decoder.revision(), Some(PdRevision::Revision3));
-
-    let source_good_crc = PdEvent {
-        timestamp: uom::si::f64::Time::new::<millisecond>(1.0),
-        data: PdEventData::PdMessage {
-            sop: 0,
-            // PD2.0 GoodCRC sent with the Source/DFP role bits.
-            wire_data: hex::decode("6101").unwrap(),
-        },
-    };
-    decoder.decode_event(&source_good_crc);
-    assert_eq!(decoder.revision(), Some(PdRevision::Revision3));
 
     let DecodedPdEvent::Message(request) = decoder.decode_event(&stream.events[2]) else {
         panic!("expected Request message");
@@ -178,67 +161,6 @@ fn semantically_decodes_recorded_pd_negotiation_with_source_state() {
 
 #[cfg(feature = "usbpd")]
 #[test]
-fn retains_discover_identity_acknowledgement() {
-    // Four-object PD3.x VDM: Discover Identity ACK, ID Header, Cert Stat and Product VDO.
-    let event = PdEvent {
-        timestamp: uom::si::f64::Time::new::<millisecond>(1.0),
-        data: PdEventData::PdMessage {
-            sop: 0,
-            wire_data: hex::decode("af4141a000ff3c4100000000000000013412").unwrap(),
-        },
-    };
-    let mut decoder = PdSessionDecoder::new();
-
-    assert!(matches!(decoder.decode_event(&event), DecodedPdEvent::Message(_)));
-    assert_eq!(decoder.revision(), Some(PdRevision::Revision3));
-    assert_eq!(
-        decoder.identity(),
-        Some(PdIdentity {
-            vendor_id: 0x413c,
-            product_id: Some(0x1234),
-            device_bcd: Some(0x0100),
-        })
-    );
-}
-
-#[cfg(feature = "usbpd")]
-#[test]
-fn retains_passively_observed_cable_identity() {
-    let request = PdEvent {
-        timestamp: uom::si::f64::Time::new::<millisecond>(1.0),
-        data: PdEventData::PdMessage {
-            sop: 1,
-            // One-object PD3.x structured VDM: Discover Identity request.
-            wire_data: hex::decode("af1101a000ff").unwrap(),
-        },
-    };
-    let response = PdEvent {
-        timestamp: uom::si::f64::Time::new::<millisecond>(2.0),
-        data: PdEventData::PdMessage {
-            sop: 1,
-            // Discover Identity ACK: ID Header, Cert Stat, Product and Passive Cable VDO.
-            wire_data: hex::decode("af5141a000ff3c410018443322110001341244260a12").unwrap(),
-        },
-    };
-    let mut decoder = PdSessionDecoder::new();
-
-    assert!(matches!(decoder.decode_event(&request), DecodedPdEvent::Message(_)));
-    assert!(decoder.cable_discovery_requested());
-    assert!(decoder.cable_identities().is_empty());
-
-    assert!(matches!(decoder.decode_event(&response), DecodedPdEvent::Message(_)));
-    let cable = &decoder.cable_identities()[0];
-    assert_eq!(cable.sop, 1);
-    assert_eq!(cable.vendor_id, 0x413c);
-    assert_eq!(cable.product_id, 0x1234);
-    assert_eq!(cable.kind, km003c_lib::PdCableKind::Passive);
-    assert_eq!(cable.vbus_current, km003c_lib::PdCableCurrent::Amps5);
-    assert_eq!(cable.maximum_vbus_voltage, Some(km003c_lib::PdCableVoltage::Volts50));
-    assert_eq!(cable.highest_speed, km003c_lib::PdCableSpeed::Usb4Gen4);
-}
-
-#[cfg(feature = "usbpd")]
-#[test]
 fn connection_events_reset_semantic_decoder_state() {
     let stream = parse_pd_events(
         "41a90205100000168bfa1200de130000750602009f80fa120000a1632c9101082cd102002cc103002cb10400454106003c21dcc08781fa12000041028b85fa1200008210dc7003238786fa1200002101878afa120000a305878afa1200004104",
@@ -246,14 +168,6 @@ fn connection_events_reset_semantic_decoder_state() {
     let mut decoder = PdSessionDecoder::new();
     decoder.decode_event(&stream.events[0]);
     assert!(decoder.source_capabilities().is_some());
-    decoder.decode_event(&PdEvent {
-        timestamp: uom::si::f64::Time::new::<millisecond>(1.0),
-        data: PdEventData::PdMessage {
-            sop: 1,
-            wire_data: hex::decode("af5141a000ff3c410018443322110001341244260a12").unwrap(),
-        },
-    });
-    assert!(!decoder.cable_identities().is_empty());
 
     let connect = PdEvent {
         timestamp: uom::si::f64::Time::new::<millisecond>(1_250_000.0),
@@ -261,7 +175,6 @@ fn connection_events_reset_semantic_decoder_state() {
     };
     assert!(matches!(decoder.decode_event(&connect), DecodedPdEvent::Connect { .. }));
     assert!(decoder.source_capabilities().is_none());
-    assert!(decoder.cable_identities().is_empty());
 
     decoder.decode_event(&stream.events[0]);
     assert!(decoder.source_capabilities().is_some());
